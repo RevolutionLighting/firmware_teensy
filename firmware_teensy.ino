@@ -1,30 +1,42 @@
-  //------------------------------------------------------------------------------------------------------------
+//-------------------------------------------------------------------------------------
 // Revolution Lighting Project Firmware
+//-------------------------------------------------------------------------------------
 //
-// Todo
-// (1) resolve timeout/crash issue after mode set
-// (2) implement/verify/debug Soft reboot (RPi Pin12/GPIO18 toggle) - Done
-// (3) implement/verify/debug Hard reboot (RPi RUN toggle) - Done
-// (4) implement code to ignore duplicate node gets - Done
-// (5) resolve event handler crashes - Done
-// (6) implement/debug fail safe (soft/feather and hard/hammer reboot logic) - Done
-// (7) comment/refactor code for readability - Started
-//------------------------------------------------------------------------------------------------------------
+// Version 0.2
+// -this version used for WW22 demos in Austin... and other locations
+// -changes to phase dimming and 0-10V mode
+// (1) resolved reverse logic error in hvDimMode() -> resolve w/Nick next version 
+// (2) added serial debugging to relayUpdate()
+// (2) removed superfluous helper functions 
+// (3) more commenting, started refactoring for standard 80 character width
+// (4) commented out failsafe reboot code but did not remove it - not req'd WW22 demos
+//
+// Version 0.1
+// -Initial commit github.com 
+// -feature ads and bug fixes from non-git 0.1
+// (1) resolved timeout/crash issue after mode set
+// (2) implemented/tested soft reboot (RPi Pin12/GPIO18 toggle)
+// (3) implemented/tested hard reboot (RPi RUN toggle)
+// (4) implemented/tested fail safe (soft/feather and hard/hammer reboot logic)
+// (5) implemented logic to ignore duplicate node gets
+// (6) resolved event handler crashes
+// (7) started commenting/refactoring code for readability
+//-------------------------------------------------------------------------------------
 #define RELEASENUMBERMAJOR 0
-#define RELEASENUMBERMINOR 1
+#define RELEASENUMBERMINOR 2
 #define LV_HV 1 //0 for LV, 1 for HV
 #include <i2c_t3.h>
 
 
-//------------------------------------------------------------------------------------------------------------
+//-------------------------------------------------------------------------------------
 // Function prototypes for event handlers
-//------------------------------------------------------------------------------------------------------------
+//-------------------------------------------------------------------------------------
 void receiveEvent(size_t count);  // I2C Receive event handler
 void requestEvent(void);          // I2C Request data event handler
 
-//------------------------------------------------------------------------------------------------------------
+//-------------------------------------------------------------------------------------
 // Memory
-//------------------------------------------------------------------------------------------------------------
+//-------------------------------------------------------------------------------------
 #define MEM_LEN 256
 #define VERSION 0
 #define PWMSET 1
@@ -40,11 +52,9 @@ void requestEvent(void);          // I2C Request data event handler
 #define SR_DAT 17
 #define SR_LAT 18
 
-//------------------------------------------------------------------------------------------------------------
+//-------------------------------------------------------------------------------------
 // Globals for Teensy-to-Pi Rest Interface
-//------------------------------------------------------------------------------------------------------------
-//#define PI_GPIO18_PIN12 32                            // Teensy Pin32 (TP2) jumper wired to Rpi GPIO18-pin12 (TP21)
-//#define PI_RUN_RESET 31                               // Teensy Pin23 to RPi Run (GPIO31)
+//-------------------------------------------------------------------------------------
 boolean ReceivedAnyI2cFromPi = false;                   // Set True first time Teensy receives data from Pi
 unsigned long bootUpMillis;                             // millis when setup() ran
 unsigned long rebootWaitTimeMillis = 45000;             // 45 seconds
@@ -54,19 +64,18 @@ unsigned long timeDeltaRx = 0;                          // loop():
 
 // Used in received event handler only
 unsigned long nTimeStampMostRecentRx;                   // Used in rx event handler
-unsigned long nTimeDeltaRx = 0;                         // Used inside of event handler
-unsigned long nTimeStampPriorRx;                        //
+unsigned long nTimeDeltaRx = 0;                         // 
+unsigned long nTimeStampPriorRx;                        // 
 unsigned long currentMillis = 0;                        //
 int softRebootTryNum = 0;                               // 
 int maxNumSoftRebootTries = 3;                          // 
 
-//------------------------------------------------------------------------------------------------------------
+//-------------------------------------------------------------------------------------
 // Globals Pin Definitions
-//------------------------------------------------------------------------------------------------------------
+//-------------------------------------------------------------------------------------
 
-const int PI_RUN_RESET = 31;                            // Hard reboot pin 
-const int PI_GPIO18_PIN12 = 32;                         // Soft reset pin
-
+const int PI_RUN_RESET = 31;                            // Teensy Pin23 to RPi Run (GPIO-31)
+const int PI_GPIO18_PIN12 = 32;                         // Soft reboot: Teensy Pin32 (TP2) to Rpi GPIO-18-pin12 (TP21)
 const int pwmPin[] = {2,3,4,5,6,9,10,29};               //
 const int analogIn[] = {A22,A0,A1,A2};                  //
 const int pSource[] = {27,28,11,13};                    //
@@ -84,19 +93,22 @@ uint8_t dimmerRelayState = 0x00;                        // ***
 uint16_t pwmData[] = {0x0000,0x0000,0x0000,0x0000,      // ***
                       0x0000,0x0000,0x0000,0x0000};
 
-//------------------------------------------------------------------------------------------------------------
+//-------------------------------------------------------------------------------------
 // Setup
-//------------------------------------------------------------------------------------------------------------
+//-------------------------------------------------------------------------------------
 void setup()
 {
-    int i;
+ 
+ // Configure Teensy Pins
     pinMode(1,OUTPUT);
     pinMode(SR_CLK,OUTPUT);
     pinMode(SR_LAT,OUTPUT);
     pinMode(SR_DAT,OUTPUT);
     pinMode(PI_RUN_RESET,OUTPUT);            
     pinMode(PI_GPIO18_PIN12, OUTPUT);       
-
+    //pinMode(vinSense,INPUT);
+  
+    int i;
     for (i=0;i<sizeof(pSource);i++)
     {
       pinMode(pSource[i],OUTPUT);
@@ -109,7 +121,7 @@ void setup()
       analogWriteFrequency(pwmPin[i],200);
       analogWrite(pwmPin[i] , 0);
     }
-
+    
     for (i=0;i<sizeof(dc);i++)
     {
       pinMode(dc[i],INPUT);
@@ -122,12 +134,13 @@ void setup()
     {
       pinMode(ainDrive[i],OUTPUT);
     } 
-    //pinMode(vinSense,INPUT);
+    
+ 
     analogWriteResolution(16);
     analogReadResolution(12);
     analogReadAveraging(256);
    
-    // Data init
+ // Data init
     received = 0;
     memset(databuf, 0, sizeof(databuf));
  
@@ -137,12 +150,12 @@ void setup()
     //delay must take place before interupt handlers are enabled
     //interupt handler ignore delay statementswait 45 seconds
     bootUpMillis = millis();
-    Serial.println("Waiting 45 seconds");
-    delay(rebootWaitTimeMillis);
-    Serial.println("45 seconds since Teensy booted");
+    //Serial.println("Waiting 45 seconds");
+    //delay(rebootWaitTimeMillis);
+    //Serial.println("45 seconds since Teensy booted");
     delay(1000);
 
-// Register wire/I2c slave received and request handlers
+ // Register wire/I2c slave received and request handlers
     Wire.onReceive(receiveEvent);
     Wire.onRequest(requestEvent);
 
@@ -150,25 +163,22 @@ void setup()
     Wire.begin(I2C_SLAVE, 0x66, I2C_PINS_7_8, I2C_PULLUP_EXT, 400000);
     delay(1000);  // wait 1 sec for i2c to start before main loop
     
-    // Write shiftreg
+ // Write shiftreg
     shiftRegisterWriteWord(0x0001);
     
-    // something strange with timing
-    //pinMode(PI_GPIO18_PIN12, OUTPUT);
-    //pinMode(PI_RUN_RESET,OUTPUT);
 
-    // Test Feather / Soft Reboot
-    // softReboot();
+  // Test Feather / Soft Reboot
+     //softReboot();
 
-    // Test Hammer / Hard Reboot
-    //hardReboot();
+  // Test Hammer / Hard Reboot
+     //hardReboot();
 
 }
 
-//------------------------------------------------------------------------------------------------------------
-// Main Loop
-//------------------------------------------------------------------------------------------------------------
 void loop() {
+//-------------------------------------------------------------------------------------
+// Main Loop
+//-------------------------------------------------------------------------------------
   //------------------------------------------------------------------------------
   // timeStampMostRecentRx = Stamped by rx event hander when an rx event occurs
   // timeDeltaRx = time since last rx
@@ -179,53 +189,56 @@ void loop() {
   // hardReboot(void)
   //------------------------------------------------------------------------------
 
-  //------------------------------------------------------------------------------
-  // REBOOT CODE TO RESOLVE I2C FAILURE
-  //------------------------------------------------------------------------------
-  // This block ensures that Teensy is receving i2c data from RPi
-  // Cases: (1) rx data has been received w/i 1s
-  //            1.1 do nothing
-  //        (2) rx data has Not been received in last sec
-  //            2.1 soft reboot (up to maxNumSoftRebootTries)
-  //            2.2 hard reboot if soft reboot tries exceeds maxNumSoftRebootTries
-  //------------------------------------------------------------------------------
-  timeDeltaRx = millis()-timeStampMostRecentRx;
-  Serial.print("Main Loop: timeDeltaRx = ");
-  Serial.println(timeDeltaRx);  
-
-  if(timeDeltaRx > 1000 && softRebootTryNum < maxNumSoftRebootTries)
-  {
-    Serial.println("******************************");
-    Serial.print("In Soft Reboot Loop ");
-    Serial.print("Try # ");
-    Serial.print(softRebootTryNum+1);
-    Serial.print("/");
-    Serial.println(maxNumSoftRebootTries);
-    Serial.println("******************************");
-    
-    softReboot();
-    Serial.print("Waiting ");
-    Serial.print(rebootWaitTimeMillis/1000);
-    Serial.println("sec for RPi to boot");
-    delay(rebootWaitTimeMillis);                
-    Serial.print(rebootWaitTimeMillis/1000);    // By then an rx event should have occured 
-    Serial.println(" seconds has elapsed");
-    softRebootTryNum +=1;   
-  } 
-  
-  if(timeDeltaRx > 1000 && softRebootTryNum == maxNumSoftRebootTries)
-  {                                                  
-    hardReboot();
-    delay(2000);          // long enough for PI to reboot
-    softRebootTryNum = 0; // does it matter that this is after delay(45s)?      
-    Serial.print("Waiting ");
-    Serial.print(rebootWaitTimeMillis/1000);
-    Serial.println("sec for RPi to boot");
-    delay(rebootWaitTimeMillis);
-    Serial.print(rebootWaitTimeMillis/1000);    // By then an rx event should have occured 
-    Serial.println(" seconds has elapsed");
-    
-  }
+//  if (LV_HV == 1)
+//  //Reboot code to resolve i2c (only for HV mode)
+//  {
+//    //------------------------------------------------------------------------------
+//    // FAILSAFE MODE - REBOOT CODE TO RESOLVE I2C FAILURE
+//    //------------------------------------------------------------------------------
+//    // This block ensures that Teensy is receving i2c data from RPi
+//    // Cases: (1) rx data has been received w/i 1s
+//    //            1.1 do nothing
+//    //        (2) rx data has Not been received in last sec
+//    //            2.1 soft reboot (up to maxNumSoftRebootTries)
+//    //            2.2 hard reboot if soft reboot tries exceeds maxNumSoftRebootTries
+//    //------------------------------------------------------------------------------
+//    timeDeltaRx = millis()-timeStampMostRecentRx;
+//    Serial.print("Main Loop: timeDeltaRx = ");
+//    Serial.println(timeDeltaRx);  
+//  
+//    if(timeDeltaRx > 1000 && softRebootTryNum < maxNumSoftRebootTries)
+//    {
+//      Serial.println("******************************");
+//      Serial.print("In Soft Reboot Loop ");
+//      Serial.print("Try # ");
+//      Serial.print(softRebootTryNum+1);
+//      Serial.print("/");
+//      Serial.println(maxNumSoftRebootTries);
+//      Serial.println("******************************");
+//      
+//      softReboot();
+//      Serial.print("Waiting ");
+//      Serial.print(rebootWaitTimeMillis/1000);
+//      Serial.println("sec for RPi to boot");
+//      delay(rebootWaitTimeMillis);                
+//      Serial.print(rebootWaitTimeMillis/1000);    // By then an rx event should have occured 
+//      Serial.println(" seconds has elapsed");
+//      softRebootTryNum +=1;   
+//    } 
+//    
+//    if(timeDeltaRx > 1000 && softRebootTryNum == maxNumSoftRebootTries)
+//    {                                                  
+//      hardReboot();
+//      delay(2000);          // long enough for PI to reboot
+//      softRebootTryNum = 0; // does it matter that this is after delay(45s)?      
+//      Serial.print("Waiting ");
+//      Serial.print(rebootWaitTimeMillis/1000);
+//      Serial.println("sec for RPi to boot");
+//      delay(rebootWaitTimeMillis);
+//      Serial.print(rebootWaitTimeMillis/1000);    // By then an rx event should have occured 
+//      Serial.println(" seconds has elapsed");
+//    }    
+//  }
   //--------------------------------------------------------------------------
   
   if (ignoreLastRx==0)
@@ -237,7 +250,7 @@ void loop() {
       // Determine mode of operation then execute accordingly
       // PWMSET    = 1     
       // PLC       = 2
-      // OPOL      = 3
+      // OPOL      = 3  *PWM Polarity
       // AIN_DRIVE = 4
       // HVDIMMODE = 8
       //--------------------------------------------------------
@@ -343,14 +356,13 @@ void loop() {
       }
     } // End if(ignoreLastRx==0)
     received = 0;
-    Serial.println("Received = 0");
+    //Serial.println("Received = 0");
   }
-} // end loop()
+} // end main loop()
 
-
-//================================================================================
+//-------------------------------------------------------------------------------------
 // Define Helper Functions
-//================================================================================
+//-------------------------------------------------------------------------------------
 
 void receiveEvent(size_t count)     
 // ------------------------------------------
@@ -365,7 +377,7 @@ void receiveEvent(size_t count)
     // ------------------------------------------------------
     if (ReceivedAnyI2cFromPi == false) // 1st packet received   
     {
-      nTimeStampMostRecentRx = millis();            // If we get an rx it become the most recent
+      nTimeStampMostRecentRx = millis();                                    // If we get an rx it become the most recent
       nTimeStampPriorRx = nTimeStampMostRecentRx;   // no delta yet
       ReceivedAnyI2cFromPi = true;
 //      Serial.println("First i2c packet received!");      
@@ -391,7 +403,6 @@ void receiveEvent(size_t count)
         }
       }
     }      
-    // *****************************************************************************
  
     size_t idx=0;
     if (count>1)    // If data has already been received
@@ -493,6 +504,8 @@ void requestEvent(void)
 }
 
 void setDimmerEdge(int dimmer,int edge)
+// dimmer = 
+// edge = 
 {
   Serial.print("Set dimmer edge dimmer =  ");
   Serial.print(dimmer);
@@ -527,23 +540,35 @@ void set0_10V(int dimmer, int mode)
 }
 
 void updateHVSR(void)
+// ------------------------------------------
+// outWord
+//
+// ------------------------------------------
 {
-//  int outputWord = ((dimmerEdge&0xF0)<<8)+((dimmerRelayState&0xF0)<<4)+((dimmerEdge&0x0F)<<4)+(dimmerRelayState&0x0F);
-  int outputWord = ((dimmerEdge&0x0F)<<12)+((dimmerRelayState&0x0F)<<8)+((dimmerEdge&0xF0))+((dimmerRelayState&0xF0)>>4);
+  int outputWord = ((dimmerEdge&0xF0)<<8)+((dimmerRelayState&0xF0)<<4)+((dimmerEdge&0x0F)<<4)+(dimmerRelayState&0x0F);
+//  int outputWord = ((dimmerEdge&0x0F)<<12)+((dimmerRelayState&0x0F)<<8)+((dimmerEdge&0xF0))+((dimmerRelayState&0xF0)>>4);
   Serial.print("Update HVSR with ");
   Serial.println(outputWord,HEX);
   shiftRegisterWriteWord(outputWord);
 }
 
 void hvDimMode (uint8_t data)
+// ------------------------------------------
+//
+//
+// ------------------------------------------
 {
   Serial.println("HV Dim Mode");
   Serial.print("HV Dim Mode data = ");
   Serial.println(data,HEX);
-  dimmer0_10Vmode=data;
+  dimmer0_10Vmode=~data; //Fixme with Nick, logic inversion ... see ~
 }
 
 void relayUpdate(void)
+// ------------------------------------------
+//
+//
+// ------------------------------------------
 {
   int i;
   int8_t mask = 0x01;
@@ -552,10 +577,13 @@ void relayUpdate(void)
   {
     bool inDimMode=((dimmer0_10Vmode&mask)!=0);
     bool pwmIsZero=(pwmData[i]==0x0000);
-    Serial.print("If statement = ");
+    //Serial.print("If statement = ");
+    Serial.print("dimmerRelayState= ");
     Serial.print(dimmerRelayState,HEX);
+    Serial.print(" inDimMode=");
     Serial.print(inDimMode);
-    Serial.print(pwmIsZero);
+    Serial.print(" pwmIsZero=");
+    Serial.println(pwmIsZero);
     if (inDimMode || pwmIsZero) //if channel in (phase-dim-mode) or (PWM is zero) then we need to open the relay.
     {
       if ((dimmerRelayState&mask)==0) //The relay was previously closed, we need to open it
