@@ -2,6 +2,14 @@
 // Revolution Lighting Project Firmware
 //-------------------------------------------------------------------------------------
 //
+// Version 0.3
+// (1) bugfix for analogIn pins (pinMode(xx, INPUT) for all analog in pins
+// (2) changed AnalogWriteFrequency to 10KHz to resolve current sense read error
+// (3) broke failsafe reboot code into a helper function rebootResolveI2C()
+// (4) removed 45s delay from setup()
+// (5) implemented 45s delay from uC bootup and failsafe reboot beginning
+// (6) added EnableFailSafeReboot boolean to enable or disable failsafe reboot code
+//
 // Version 0.2
 // -this version used for WW22 demos in Austin... and other locations
 // -changes to phase dimming and 0-10V mode
@@ -23,8 +31,8 @@
 // (7) started commenting/refactoring code for readability
 //-------------------------------------------------------------------------------------
 #define RELEASENUMBERMAJOR 0
-#define RELEASENUMBERMINOR 2
-#define LV_HV 1 //0 for LV, 1 for HV
+#define RELEASENUMBERMINOR 3
+#define LV_HV 0 //0 for LV, 1 for HV
 #include <i2c_t3.h>
 
 
@@ -55,20 +63,25 @@ void requestEvent(void);          // I2C Request data event handler
 //-------------------------------------------------------------------------------------
 // Globals for Teensy-to-Pi Rest Interface
 //-------------------------------------------------------------------------------------
+
+boolean EnableFailSafeReboot = true;                    // false disables failsafe soft/hard reboot code
 boolean ReceivedAnyI2cFromPi = false;                   // Set True first time Teensy receives data from Pi
+boolean bootTimeWaitDone = false;
 unsigned long bootUpMillis;                             // millis when setup() ran
 unsigned long rebootWaitTimeMillis = 45000;             // 45 seconds
 unsigned long timeStampMostRecentRx;                    // loop(): Zero indicates no Rx event received yet
 unsigned long timeSinceMostRecentRx;                    // loop(): Zero indicates no Rx event received yet
 unsigned long timeDeltaRx = 0;                          // loop(): 
 
+int softRebootTryNum = 0;                               // 
+int maxNumSoftRebootTries = 3;                          // 
+
 // Used in received event handler only
 unsigned long nTimeStampMostRecentRx;                   // Used in rx event handler
 unsigned long nTimeDeltaRx = 0;                         // 
 unsigned long nTimeStampPriorRx;                        // 
 unsigned long currentMillis = 0;                        //
-int softRebootTryNum = 0;                               // 
-int maxNumSoftRebootTries = 3;                          // 
+
 
 //-------------------------------------------------------------------------------------
 // Globals Pin Definitions
@@ -118,7 +131,7 @@ void setup()
     for (i=0;i<sizeof(pwmPin);i++)
     {
       pinMode(pwmPin[i],OUTPUT);
-      analogWriteFrequency(pwmPin[i],200);
+      analogWriteFrequency(pwmPin[i],200);    // PWM freq 
       analogWrite(pwmPin[i] , 0);
     }
     
@@ -133,8 +146,12 @@ void setup()
     for (i=0;i<sizeof(ainDrive);i++)
     {
       pinMode(ainDrive[i],OUTPUT);
+      analogWriteFrequency(ainDrive[i],10000);      // 10kHz PWM freq
     } 
-    
+    for (i=0;i<sizeof(analogIn);i++)                // 
+    {
+      pinMode(analogIn[i],INPUT);
+    }
  
     analogWriteResolution(16);
     analogReadResolution(12);
@@ -180,6 +197,7 @@ void loop() {
 // Main Loop
 //-------------------------------------------------------------------------------------
   //------------------------------------------------------------------------------
+  // EnableFailSafeReboot: true to enable failsafe reboot code, false to disable
   // timeStampMostRecentRx = Stamped by rx event hander when an rx event occurs
   // timeDeltaRx = time since last rx
   // rebootWaitTimeMillis: # of ms to wait for RPi to reboot
@@ -187,60 +205,22 @@ void loop() {
   // softRebootTryNum: iterator
   // softReboot(void)
   // hardReboot(void)
+  // rebootResolveI2C(void)
   //------------------------------------------------------------------------------
 
-//  if (LV_HV == 1)
-//  //Reboot code to resolve i2c (only for HV mode)
-//  {
-//    //------------------------------------------------------------------------------
-//    // FAILSAFE MODE - REBOOT CODE TO RESOLVE I2C FAILURE
-//    //------------------------------------------------------------------------------
-//    // This block ensures that Teensy is receving i2c data from RPi
-//    // Cases: (1) rx data has been received w/i 1s
-//    //            1.1 do nothing
-//    //        (2) rx data has Not been received in last sec
-//    //            2.1 soft reboot (up to maxNumSoftRebootTries)
-//    //            2.2 hard reboot if soft reboot tries exceeds maxNumSoftRebootTries
-//    //------------------------------------------------------------------------------
-//    timeDeltaRx = millis()-timeStampMostRecentRx;
-//    Serial.print("Main Loop: timeDeltaRx = ");
-//    Serial.println(timeDeltaRx);  
-//  
-//    if(timeDeltaRx > 1000 && softRebootTryNum < maxNumSoftRebootTries)
-//    {
-//      Serial.println("******************************");
-//      Serial.print("In Soft Reboot Loop ");
-//      Serial.print("Try # ");
-//      Serial.print(softRebootTryNum+1);
-//      Serial.print("/");
-//      Serial.println(maxNumSoftRebootTries);
-//      Serial.println("******************************");
-//      
-//      softReboot();
-//      Serial.print("Waiting ");
-//      Serial.print(rebootWaitTimeMillis/1000);
-//      Serial.println("sec for RPi to boot");
-//      delay(rebootWaitTimeMillis);                
-//      Serial.print(rebootWaitTimeMillis/1000);    // By then an rx event should have occured 
-//      Serial.println(" seconds has elapsed");
-//      softRebootTryNum +=1;   
-//    } 
-//    
-//    if(timeDeltaRx > 1000 && softRebootTryNum == maxNumSoftRebootTries)
-//    {                                                  
-//      hardReboot();
-//      delay(2000);          // long enough for PI to reboot
-//      softRebootTryNum = 0; // does it matter that this is after delay(45s)?      
-//      Serial.print("Waiting ");
-//      Serial.print(rebootWaitTimeMillis/1000);
-//      Serial.println("sec for RPi to boot");
-//      delay(rebootWaitTimeMillis);
-//      Serial.print(rebootWaitTimeMillis/1000);    // By then an rx event should have occured 
-//      Serial.println(" seconds has elapsed");
-//    }    
-//  }
-  //--------------------------------------------------------------------------
-  
+
+   if (EnableFailSafeReboot == true && millis()-bootUpMillis > 45000)
+  {
+    if (bootTimeWaitDone == false)
+    {
+      Serial.println("**************************");
+      Serial.println("45s elapsed from uC bootup");
+      Serial.println("**************************");
+      bootTimeWaitDone = true;
+    }
+    rebootResolveI2C();   // Check I2C, enter soft/hard reboot routine if necessary
+  }
+
   if (ignoreLastRx==0)
   {
     if(received)
@@ -447,7 +427,7 @@ void requestEvent(void)
   }
   if (addr==AIN)
   {
-//    Serial.println("AIN");
+    //Serial.println("AIN");
     databuf[0]=8;
     for (int i=0;i<4;i++)
     {
@@ -642,32 +622,52 @@ void hardReboot(void)
     Serial.println("Done");
 }
 
-//void rebootResolveI2C(void)
-//{
-//  //------------------------------------------------------------------------------
-//  // REBOOT CODE TO RESOLVE I2C FAILURE
-//  // Consider changing to accept maxNumSoftRebootTries passed as a parameter 
-//  // This block ensures that Teensy is receving i2c data from RPi
-//  // Cases: (1) rx data has been received w/i last 1sec
-//  //            1.1 do nothing
-//  //        (2) rx data has Not been received in last sec
-//  //            2.1 soft reboot (up to maxNumSoftRebootTries)
-//  //            2.2 hard reboot if soft reboot tries exceeds maxNumSoftRebootTries
-//  // softRebootTryNum 
-//  // maxNumSoftRebootTries
-//  // softReboot(void)
-//  // hardReboot(void)
-//  //------------------------------------------------------------------------------
-//  // int softRebootTryNum = 0;
-//  
-//  while(softRebootTryNum < maxNumSoftRebootTries && timeSinceLastRx > 1000)     //
-//  {
-//    softReboot();
-//    maxNumSoftRebootTries += 1;
-//    delay(rebootWaitTimeMillis); 
-//    currentMillis = millis();
-//   }                                                  // 
-//    hardReboot();                                     // 
-//    softRebootTryNum = 0;
-//    delay(rebootWaitTimeMillis);
-//}
+void rebootResolveI2C(void)
+//------------------------------------------------------------------------------
+// FAILSAFE MODE - REBOOT CODE TO RESOLVE I2C FAILURE
+//------------------------------------------------------------------------------
+// This block ensures that Teensy is receving i2c data from RPi
+// Cases: (1) rx data has been received w/i 1s
+//            1.1 do nothing
+//        (2) rx data has Not been received in last sec
+//            2.1 soft reboot (up to maxNumSoftRebootTries)
+//            2.2 hard reboot if soft reboot tries exceeds maxNumSoftRebootTries
+//------------------------------------------------------------------------------
+{
+  timeDeltaRx = millis()-timeStampMostRecentRx;
+  Serial.print("Main Loop: timeDeltaRx = ");
+  Serial.println(timeDeltaRx);  
+  
+  if(timeDeltaRx > 1000 && softRebootTryNum < maxNumSoftRebootTries)
+  {
+    Serial.println("******************************");
+    Serial.print("In Soft Reboot Loop ");
+    Serial.print("Try # ");
+    Serial.print(softRebootTryNum+1);
+    Serial.print("/");
+    Serial.println(maxNumSoftRebootTries);
+    Serial.println("******************************");
+    
+    softReboot();
+    Serial.print("Waiting ");
+    Serial.print(rebootWaitTimeMillis/1000);
+    Serial.println("sec for RPi to boot");
+    delay(rebootWaitTimeMillis);                
+    Serial.print(rebootWaitTimeMillis/1000);    // By then an rx event should have occured 
+    Serial.println(" seconds has elapsed");
+    softRebootTryNum +=1;   
+  } 
+  
+  if(timeDeltaRx > 1000 && softRebootTryNum == maxNumSoftRebootTries)
+  {                                                  
+    hardReboot();
+    delay(2000);          // long enough for PI to reboot
+    softRebootTryNum = 0; // does it matter that this is after delay(45s)?      
+    Serial.print("Waiting ");
+    Serial.print(rebootWaitTimeMillis/1000);
+    Serial.println("sec for RPi to boot");
+    delay(rebootWaitTimeMillis);
+    Serial.print(rebootWaitTimeMillis/1000);    // By then an rx event should have occured 
+    Serial.println(" seconds has elapsed");
+  }    
+}
