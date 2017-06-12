@@ -2,12 +2,19 @@
 // Revolution Lighting Project Firmware
 //-------------------------------------------------------------------------------------
 //
+// Version 0.4
+// (1) resolved wet/dry contact failure
+// (2) found sizeof(array) bug and implemented work around
+//
 // Version 0.3
+// -resolved 0-10v current sensing error
+// -added flag to disable/enable failsafe reboot code
+// -sped up teensy boot time removing 45s delay from setup()
 // (1) bugfix for analogIn pins (pinMode(xx, INPUT) for all analog in pins
 // (2) changed AnalogWriteFrequency to 10KHz to resolve current sense read error
-// (3) broke failsafe reboot code into a helper function rebootResolveI2C()
+// (3) brokeout failsafe reboot code into a helper function rebootResolveI2C()
 // (4) removed 45s delay from setup()
-// (5) implemented 45s delay from uC bootup and failsafe reboot beginning
+// (5) reimplemented 45s delay as a conditional in main loop
 // (6) added EnableFailSafeReboot boolean to enable or disable failsafe reboot code
 //
 // Version 0.2
@@ -31,10 +38,9 @@
 // (7) started commenting/refactoring code for readability
 //-------------------------------------------------------------------------------------
 #define RELEASENUMBERMAJOR 0
-#define RELEASENUMBERMINOR 3
-#define LV_HV 0 //0 for LV, 1 for HV
+#define RELEASENUMBERMINOR 4
+#define LV_HV 0 //LV=0, HV=1
 #include <i2c_t3.h>
-
 
 //-------------------------------------------------------------------------------------
 // Function prototypes for event handlers
@@ -45,56 +51,66 @@ void requestEvent(void);          // I2C Request data event handler
 //-------------------------------------------------------------------------------------
 // Memory
 //-------------------------------------------------------------------------------------
-#define MEM_LEN 256
-#define VERSION 0
-#define PWMSET 1
-#define PLC 2
-#define OPOL 3
-#define AIN_DRIVE 4
-#define AIN 5
-#define DC 6
-#define IMEAS 7
-#define HVDIMMODE 8
-#define VIN 9
-#define SR_CLK 19
-#define SR_DAT 17
-#define SR_LAT 18
+#define MEM_LEN 256   //
+#define VERSION 0     // get command code for version
+#define PWMSET 1      // set command code for PWM (channel and value 0-65535)
+#define PLC 2         // get command code for
+#define OPOL 3        // 
+#define AIN_DRIVE 4   //
+#define AIN 5         //
+#define DRY_CONTACT 6 // get command code for wet/dry contact
+#define IMEAS 7       //
+#define HVDIMMODE 8   //
+#define VIN 9         //
+#define SR_CLK 19     // I2c clock
+#define SR_DAT 17     // I2C data
+#define SR_LAT 18     // ShiftReg clock
 
 //-------------------------------------------------------------------------------------
 // Globals for Teensy-to-Pi Rest Interface
 //-------------------------------------------------------------------------------------
 
-boolean EnableFailSafeReboot = true;                    // false disables failsafe soft/hard reboot code
-boolean ReceivedAnyI2cFromPi = false;                   // Set True first time Teensy receives data from Pi
-boolean bootTimeWaitDone = false;
-unsigned long bootUpMillis;                             // millis when setup() ran
+boolean EnableFailSafeReboot = false;                   // false disables failsafe soft/hard reboot code
+boolean ReceivedAnyI2cFromPi = false;                   // Set true 1st time Teensy receives data from Pi
+boolean bootTimeWaitDone = false;                       // Set true in mainloop after bootWaitTime exceeded
+unsigned long bootUpMillis;                             // timestamp when setup() ran
 unsigned long rebootWaitTimeMillis = 45000;             // 45 seconds
 unsigned long timeStampMostRecentRx;                    // loop(): Zero indicates no Rx event received yet
 unsigned long timeSinceMostRecentRx;                    // loop(): Zero indicates no Rx event received yet
 unsigned long timeDeltaRx = 0;                          // loop(): 
 
-int softRebootTryNum = 0;                               // 
-int maxNumSoftRebootTries = 3;                          // 
+int softRebootTryNum = 0;                               // iterator
+int maxNumSoftRebootTries = 3;                          // max # soft reboot tries before hard rebooting
 
 // Used in received event handler only
 unsigned long nTimeStampMostRecentRx;                   // Used in rx event handler
-unsigned long nTimeDeltaRx = 0;                         // 
-unsigned long nTimeStampPriorRx;                        // 
-unsigned long currentMillis = 0;                        //
-
+unsigned long nTimeDeltaRx = 0;                         // ""
+unsigned long nTimeStampPriorRx;                        // ""
 
 //-------------------------------------------------------------------------------------
 // Globals Pin Definitions
 //-------------------------------------------------------------------------------------
 
-const int PI_RUN_RESET = 31;                            // Teensy Pin23 to RPi Run (GPIO-31)
+const int PI_RUN_RESET = 31;                            // Hard reboot: Teensy Pin23 to RPi Run (GPIO-31)
 const int PI_GPIO18_PIN12 = 32;                         // Soft reboot: Teensy Pin32 (TP2) to Rpi GPIO-18-pin12 (TP21)
-const int pwmPin[] = {2,3,4,5,6,9,10,29};               //
-const int analogIn[] = {A22,A0,A1,A2};                  //
-const int pSource[] = {27,28,11,13};                    //
-const int ainDrive[] = {21,22,23,30};                   //
-const int dc[] = {12,24,25,26};                         //
-const int iMeas[] = {A14,A15,A16,A17,A18,A19,A20,A21};  //
+
+const int pwmPin[] = {2,3,4,5,6,9,10,29};               // pwmPins 
+const int n_pwmPin = 8;                                 // # of pwmPins -> reimplement w/STL
+
+const int analogIn[] = {A22,A0,A1,A2};                  // 
+const int n_analogIn = 4;                               //
+
+const int pSource[] = {27,28,11,13};                    // 
+const int n_pSource =  4;                               //
+
+const int ainDrive[] = {21,22,23,30};                   // 
+const int n_ainDrive = 4;                               //
+
+const int dc[] = {12,24,25,26};                         // Dry contact
+const int n_dc = 4;                                     //
+
+const int iMeas[] = {A14,A15,A16,A17,A18,A19,A20,A21};  // Current sense
+const int n_iMeas = 8;
 
 uint8_t ignoreLastRx=0;                                 // ***
 uint8_t databuf[MEM_LEN];                               // databuf[256] ***
@@ -113,42 +129,44 @@ void setup()
 {
  
  // Configure Teensy Pins
-    pinMode(1,OUTPUT);
-    pinMode(SR_CLK,OUTPUT);
-    pinMode(SR_LAT,OUTPUT);
-    pinMode(SR_DAT,OUTPUT);
-    pinMode(PI_RUN_RESET,OUTPUT);            
-    pinMode(PI_GPIO18_PIN12, OUTPUT);       
+    pinMode(1,OUTPUT);                // TP1
+    pinMode(SR_CLK,OUTPUT);           // I2C clock
+    pinMode(SR_DAT,OUTPUT);           // I2C data
+    pinMode(SR_LAT,OUTPUT);           // ShiftRegister clock
+    pinMode(PI_RUN_RESET,OUTPUT);     // Hard reboot       
+    pinMode(PI_GPIO18_PIN12, OUTPUT); // Soft reboot       
     //pinMode(vinSense,INPUT);
   
     int i;
-    for (i=0;i<sizeof(pSource);i++)
+    
+    for (i=0;i<n_pSource;i++)
     {
       pinMode(pSource[i],OUTPUT);
       digitalWrite(pSource[i],LOW);
     }
     
-    for (i=0;i<sizeof(pwmPin);i++)
+    for (i=0;i<n_pwmPin;i++)
     {
       pinMode(pwmPin[i],OUTPUT);
       analogWriteFrequency(pwmPin[i],200);    // PWM freq 
       analogWrite(pwmPin[i] , 0);
     }
     
-    for (i=0;i<sizeof(dc);i++)
+    for (i=0;i<n_dc;i++)
     {
       pinMode(dc[i],INPUT);
     }
-    for (i=0;i<sizeof(iMeas);i++)
+
+    for (i=0;i<n_iMeas;i++)
     {
       pinMode(iMeas[i],INPUT);
     }
-    for (i=0;i<sizeof(ainDrive);i++)
+    for (i=0;i<n_ainDrive;i++)
     {
       pinMode(ainDrive[i],OUTPUT);
       analogWriteFrequency(ainDrive[i],10000);      // 10kHz PWM freq
     } 
-    for (i=0;i<sizeof(analogIn);i++)                // 
+    for (i=0;i<n_analogIn;i++)                // 
     {
       pinMode(analogIn[i],INPUT);
     }
@@ -192,24 +210,22 @@ void setup()
 
 }
 
-void loop() {
+void loop()
 //-------------------------------------------------------------------------------------
 // Main Loop
 //-------------------------------------------------------------------------------------
-  //------------------------------------------------------------------------------
-  // EnableFailSafeReboot: true to enable failsafe reboot code, false to disable
-  // timeStampMostRecentRx = Stamped by rx event hander when an rx event occurs
-  // timeDeltaRx = time since last rx
-  // rebootWaitTimeMillis: # of ms to wait for RPi to reboot
-  // maxNumSoftRebootTries: hard reset this # of softReboot tries exceeded
-  // softRebootTryNum: iterator
-  // softReboot(void)
-  // hardReboot(void)
-  // rebootResolveI2C(void)
-  //------------------------------------------------------------------------------
-
-
-   if (EnableFailSafeReboot == true && millis()-bootUpMillis > 45000)
+// EnableFailSafeReboot: true to enable failsafe reboot code, false to disable
+// timeStampMostRecentRx = Stamped by rx event hander when an rx event occurs
+// timeDeltaRx = time since last rx
+// rebootWaitTimeMillis: # of ms to wait for RPi to reboot
+// maxNumSoftRebootTries: hard reset when this # of softReboot tries exceeded
+// softRebootTryNum: iterator
+// softReboot(void)
+// hardReboot(void)
+// rebootResolveI2C(void): failsafe reboot mode
+//-------------------------------------------------------------------------------------
+{
+  if (EnableFailSafeReboot == true && millis()-bootUpMillis > 45000)
   {
     if (bootTimeWaitDone == false)
     {
@@ -225,16 +241,16 @@ void loop() {
   {
     if(received)
     {
-      Serial.println("***Received Data***");
+      Serial.println("***Received SET Command***");
       //--------------------------------------------------------
       // Determine mode of operation then execute accordingly
-      // PWMSET    = 1     
-      // PLC       = 2
-      // OPOL      = 3  *PWM Polarity
-      // AIN_DRIVE = 4
-      // HVDIMMODE = 8
+      // PWMSET    = 1  ->    
+      // PLC       = 2  -> 
+      // OPOL      = 3  -> Set PWM Polarity
+      // AIN_DRIVE = 4  -> 
+      // HVDIMMODE = 8  -> 
       //--------------------------------------------------------
-      if (databuf[0]==PWMSET)
+      if (databuf[0]==PWMSET)   //PWMSET=1
       {
         Serial.println("PWM");
         Serial.print("PWM data = ");
@@ -254,7 +270,7 @@ void loop() {
           relayUpdate();
         }
       }
-      else if (databuf[0]==PLC)
+      else if (databuf[0]==PLC)     //PLC=2
       {
         Serial.print("PLC\n");
         uint8_t plcData=databuf[1];
@@ -277,7 +293,7 @@ void loop() {
           
         }
       }
-      else if (databuf[0]==OPOL)
+      else if (databuf[0]==OPOL)  //OPOL=3
       {
         if (LV_HV==0)
         {
@@ -314,7 +330,7 @@ void loop() {
           }
         }
       }
-      else if (databuf[0]==AIN_DRIVE)
+      else if (databuf[0]==AIN_DRIVE)   //AIN_DRIVE=4
       {
         Serial.println("0-10V Drive");
         Serial.print("0-10V Drive data = ");
@@ -329,7 +345,7 @@ void loop() {
           analogWrite(ainDrive[i],driveValue);
         }
       }
-      else if (databuf[0]==HVDIMMODE)
+      else if (databuf[0]==HVDIMMODE)   //HVDIMMODE=8
       {
         hvDimMode(databuf[1]);
         Serial.println("HVDIMMODE");
@@ -346,6 +362,7 @@ void loop() {
 
 void receiveEvent(size_t count)     
 // ------------------------------------------
+// Node set command received:
 // count unsigned integer type of atleast 16-bit
 // handle Rx Event (incoming I2C data)
 // ReceivedAnyI2cFromPi - setup as false. Set to true when first i2c starts
@@ -413,19 +430,23 @@ void receiveEvent(size_t count)
     }
 } // end receive event handler
 
-//
-// handle Tx Event (outgoing I2C data)
-//
+
+
 void requestEvent(void)
+// ------------------------------------------
+// Node GET Command received:
+// Teensy Tx Event (outgoing I2C data)
+// addr = command byte requested by Node i2c
+// ------------------------------------------
 {
-  if (addr==VERSION)
+  if (addr==VERSION)              // Send Firmware Version Info
   {
     databuf[0]=3;
     databuf[1]=LV_HV;
     databuf[2]=RELEASENUMBERMAJOR;
     databuf[3]=RELEASENUMBERMINOR;
   }
-  if (addr==AIN)
+  if (addr==AIN)                  // Send
   {
     //Serial.println("AIN");
     databuf[0]=8;
@@ -436,19 +457,26 @@ void requestEvent(void)
       databuf[(2*i)+2]=char(data&0xFF);
     }
   }
-  if (addr==DC)
+  if (addr==DRY_CONTACT)                   //
   {
+    //read #4
+    //if 1 add 1 to result and left shift
+    //
     int result=0;
     for (int i=3;i>=0;i--)
     {
-      result*=2;
+      result*=2;  // left shift 1
       if (digitalRead(dc[i])==HIGH) result+=1;
     }
+    
     databuf[0]=1;
     databuf[1]=result;
+//    Serial.println("Get dry contact =  ");
+//    Serial.print("Result = ");
+//    Serial.println(result);
   }
-  if (addr==IMEAS)
-  {
+  if (addr==IMEAS)                //
+  {     
     databuf[0]=16;
     int count=0;
     long data[8]={0,0,0,0,0,0,0,0};
@@ -472,7 +500,7 @@ void requestEvent(void)
       databuf[(2*i)+2]=char(data[i]&0xFF);
     }
   }
-//  if (addr==VIN)
+//  if (addr==VIN)                //
 //  {
 //    databuf[0]=2;
     
@@ -484,8 +512,10 @@ void requestEvent(void)
 }
 
 void setDimmerEdge(int dimmer,int edge)
+// ------------------------------------------
 // dimmer = 
 // edge = 
+// ------------------------------------------
 {
   Serial.print("Set dimmer edge dimmer =  ");
   Serial.print(dimmer);
@@ -503,6 +533,12 @@ void setDimmerEdge(int dimmer,int edge)
 }
 
 void set0_10V(int dimmer, int mode)
+// ------------------------------------------
+// dimmer
+// dimmer0_10Vmode
+// mode
+// relayUpdate()
+// ------------------------------------------
 {
   Serial.print("Set 0_10V mode dimmer =  ");
   Serial.print(dimmer);
@@ -521,8 +557,10 @@ void set0_10V(int dimmer, int mode)
 
 void updateHVSR(void)
 // ------------------------------------------
-// outWord
-//
+// dimmerEdge
+// dimmerRelayState
+// outputWord
+// shiftRegisterWriteWord()
 // ------------------------------------------
 {
   int outputWord = ((dimmerEdge&0xF0)<<8)+((dimmerRelayState&0xF0)<<4)+((dimmerEdge&0x0F)<<4)+(dimmerRelayState&0x0F);
@@ -534,8 +572,7 @@ void updateHVSR(void)
 
 void hvDimMode (uint8_t data)
 // ------------------------------------------
-//
-//
+// dimmer0_10Vmode
 // ------------------------------------------
 {
   Serial.println("HV Dim Mode");
@@ -546,8 +583,11 @@ void hvDimMode (uint8_t data)
 
 void relayUpdate(void)
 // ------------------------------------------
-//
-//
+// dimmerRelayState
+// inDimMode
+// mask
+// pwmIsZero
+// updateHVSR()
 // ------------------------------------------
 {
   int i;
@@ -622,6 +662,26 @@ void hardReboot(void)
     Serial.println("Done");
 }
 
+//void printConfig(void)
+//// ------------------------------------------------
+//// Print channels and config received for each channel
+//// Teensy High connnects RPi Run low through Mosfet
+//// ------------------------------------------------
+//{
+//    Serial.println("*****************************");
+//    Serial.println("Hard Reboot RPi!");
+//    Serial.println("*****************************");
+//    Serial.println("PI_RUN toggle for 1 sec");
+//    digitalWrite(PI_RUN_RESET, HIGH);
+//    delay(1000);
+//    Serial.println("Done");      
+//    Serial.println("PI_RUN returning to normal");
+//    
+//    digitalWrite(PI_RUN_RESET, LOW);
+//    Serial.println("Done");
+//}
+
+
 void rebootResolveI2C(void)
 //------------------------------------------------------------------------------
 // FAILSAFE MODE - REBOOT CODE TO RESOLVE I2C FAILURE
@@ -671,3 +731,14 @@ void rebootResolveI2C(void)
     Serial.println(" seconds has elapsed");
   }    
 }
+
+//int strlen(const char *data) 
+//{
+//    int c = 0;
+//    const char *p = data;
+//    while (*p) {
+//        c++;
+//        p++;
+//    }
+//    return c;
+//}
