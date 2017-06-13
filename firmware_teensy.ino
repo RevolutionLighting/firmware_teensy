@@ -3,7 +3,7 @@
 //-------------------------------------------------------------------------------------
 //
 // Version 0.4
-// (1) resolved wet/dry contact failure
+// (1) resolved wet/dry contact failure on all
 // (2) found sizeof(array) bug and implemented work around
 //
 // Version 0.3
@@ -43,9 +43,14 @@
 #include <i2c_t3.h>
 
 //-------------------------------------------------------------------------------------
+//  # of elements in array = total array length / size of each element
+//-------------------------------------------------------------------------------------
+#define NELEMS(x)  (sizeof(x) / sizeof((x)[0]))
+
+//-------------------------------------------------------------------------------------
 // Function prototypes for event handlers
 //-------------------------------------------------------------------------------------
-void receiveEvent(size_t count);  // I2C Receive event handler
+void receiveEvent(size_t count);  // I2C Receive event handler (count = numBytesRxd)
 void requestEvent(void);          // I2C Request data event handler
 
 //-------------------------------------------------------------------------------------
@@ -113,7 +118,7 @@ const int iMeas[] = {A14,A15,A16,A17,A18,A19,A20,A21};  // Current sense
 const int n_iMeas = 8;
 
 uint8_t ignoreLastRx=0;                                 // ***
-uint8_t databuf[MEM_LEN];                               // databuf[256] ***
+uint8_t databuf[MEM_LEN];                               // databuf[256] - i2c data
 volatile uint8_t received;                              // ***
 uint8_t addr;                                           // ***
 int dimmer0_10Vmode = 0x00;                             // ***
@@ -139,34 +144,34 @@ void setup()
   
     int i;
     
-    for (i=0;i<n_pSource;i++)
+    for (i=0;i<(sizeof(pSource)/4);i++) // length of total array / length of element (byte) = # elements
     {
       pinMode(pSource[i],OUTPUT);
       digitalWrite(pSource[i],LOW);
     }
     
-    for (i=0;i<n_pwmPin;i++)
+    for (i=0;i<(sizeof(pwmPin)/4);i++)
     {
       pinMode(pwmPin[i],OUTPUT);
       analogWriteFrequency(pwmPin[i],200);    // PWM freq 
       analogWrite(pwmPin[i] , 0);
     }
     
-    for (i=0;i<n_dc;i++)
+    for (i=0;i<(sizeof(dc)/4);i++)
     {
       pinMode(dc[i],INPUT);
     }
 
-    for (i=0;i<n_iMeas;i++)
+    for (i=0;i<(sizeof(iMeas)/4);i++)
     {
       pinMode(iMeas[i],INPUT);
     }
-    for (i=0;i<n_ainDrive;i++)
+    for (i=0;i<(sizeof(ainDrive)/4);i++)
     {
       pinMode(ainDrive[i],OUTPUT);
       analogWriteFrequency(ainDrive[i],10000);      // 10kHz PWM freq
     } 
-    for (i=0;i<n_analogIn;i++)                // 
+    for (i=0;i<(sizeof(analogIn)/4);i++)                // 
     {
       pinMode(analogIn[i],INPUT);
     }
@@ -177,7 +182,7 @@ void setup()
    
  // Data init
     received = 0;
-    memset(databuf, 0, sizeof(databuf));
+    memset(databuf, 0, sizeof(databuf));  // /4 
  
     Serial.begin(115200);
     Serial.println("Teensy Setup has run! We've Booted!");
@@ -239,7 +244,7 @@ void loop()
 
   if (ignoreLastRx==0)
   {
-    if(received)
+    if(received)        // initialized to zero in setup; received = # of bytes rx'd
     {
       Serial.println("***Received SET Command***");
       //--------------------------------------------------------
@@ -363,8 +368,8 @@ void loop()
 void receiveEvent(size_t count)     
 // ------------------------------------------
 // Node set command received:
-// count unsigned integer type of atleast 16-bit
 // handle Rx Event (incoming I2C data)
+// count = number of bytes received
 // ReceivedAnyI2cFromPi - setup as false. Set to true when first i2c starts
 // timeStampMostRecentRx = 0
 // ------------------------------------------
@@ -401,8 +406,8 @@ void receiveEvent(size_t count)
       }
     }      
  
-    size_t idx=0;
-    if (count>1)    // If data has already been received
+    size_t idx=0;   // unsigned int >= 16-bit
+    if (count>1)    // If data has already been received (initialize to zero in setup)
     {
       while(idx < count)
       {
@@ -435,18 +440,18 @@ void receiveEvent(size_t count)
 void requestEvent(void)
 // ------------------------------------------
 // Node GET Command received:
-// Teensy Tx Event (outgoing I2C data)
+// Teensy Tx Event (I2C data -> PI)
 // addr = command byte requested by Node i2c
 // ------------------------------------------
 {
-  if (addr==VERSION)              // Send Firmware Version Info
+  if (addr==VERSION)              // 0 - Send Firmware Version Info
   {
     databuf[0]=3;
     databuf[1]=LV_HV;
     databuf[2]=RELEASENUMBERMAJOR;
     databuf[3]=RELEASENUMBERMINOR;
   }
-  if (addr==AIN)                  // Send
+  if (addr==AIN)                  // 5 -
   {
     //Serial.println("AIN");
     databuf[0]=8;
@@ -457,7 +462,7 @@ void requestEvent(void)
       databuf[(2*i)+2]=char(data&0xFF);
     }
   }
-  if (addr==DRY_CONTACT)                   //
+  if (addr==DRY_CONTACT)           // 6
   {
     //read #4
     //if 1 add 1 to result and left shift
@@ -475,7 +480,7 @@ void requestEvent(void)
 //    Serial.print("Result = ");
 //    Serial.println(result);
   }
-  if (addr==IMEAS)                //
+  if (addr==IMEAS)                // 7
   {     
     databuf[0]=16;
     int count=0;
@@ -500,7 +505,7 @@ void requestEvent(void)
       databuf[(2*i)+2]=char(data[i]&0xFF);
     }
   }
-//  if (addr==VIN)                //
+//  if (addr==VIN)                // 9
 //  {
 //    databuf[0]=2;
     
@@ -583,6 +588,7 @@ void hvDimMode (uint8_t data)
 
 void relayUpdate(void)
 // ------------------------------------------
+// ******
 // dimmerRelayState
 // inDimMode
 // mask
@@ -662,26 +668,6 @@ void hardReboot(void)
     Serial.println("Done");
 }
 
-//void printConfig(void)
-//// ------------------------------------------------
-//// Print channels and config received for each channel
-//// Teensy High connnects RPi Run low through Mosfet
-//// ------------------------------------------------
-//{
-//    Serial.println("*****************************");
-//    Serial.println("Hard Reboot RPi!");
-//    Serial.println("*****************************");
-//    Serial.println("PI_RUN toggle for 1 sec");
-//    digitalWrite(PI_RUN_RESET, HIGH);
-//    delay(1000);
-//    Serial.println("Done");      
-//    Serial.println("PI_RUN returning to normal");
-//    
-//    digitalWrite(PI_RUN_RESET, LOW);
-//    Serial.println("Done");
-//}
-
-
 void rebootResolveI2C(void)
 //------------------------------------------------------------------------------
 // FAILSAFE MODE - REBOOT CODE TO RESOLVE I2C FAILURE
@@ -732,13 +718,21 @@ void rebootResolveI2C(void)
   }    
 }
 
-//int strlen(const char *data) 
+//int arrayLen(####) 
+//// ------------------------------------------------
+//// return # of element in ####
+//// ------------------------------------------------
 //{
-//    int c = 0;
-//    const char *p = data;
-//    while (*p) {
-//        c++;
-//        p++;
-//    }
-//    return c;
+//    not implemented
 //}
+
+//void printConfig(void)
+//// ------------------------------------------------
+//// Print channels and config received for each channel
+//// Teensy High connnects RPi Run low through Mosfet
+//// ------------------------------------------------
+//{
+//  not implemented
+//}
+
+
