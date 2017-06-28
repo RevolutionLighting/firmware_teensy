@@ -1,6 +1,10 @@
 //-------------------------------------------------------------------------------------
 // Revolution Lighting Project Firmware
 //-------------------------------------------------------------------------------------
+// Version 0.5
+// (1) fixed bug in AIN_Drive set command which caused dry contact #1 input to be
+//     corrupted, i.e. stuck on logic 1
+// (2) This version used for Amazon demo
 //
 // Version 0.4
 // (1) resolved wet/dry contact failure on all
@@ -38,7 +42,7 @@
 // (7) started commenting/refactoring code for readability
 //-------------------------------------------------------------------------------------
 #define RELEASENUMBERMAJOR 0
-#define RELEASENUMBERMINOR 4
+#define RELEASENUMBERMINOR 5
 #define LV_HV 0 //LV=0, HV=1
 #include <i2c_t3.h>
 
@@ -156,11 +160,18 @@ void setup()
       analogWriteFrequency(pwmPin[i],200);    // PWM freq 
       analogWrite(pwmPin[i] , 0);
     }
+
     
-    for (i=0;i<(sizeof(dc)/4);i++)
-    {
-      pinMode(dc[i],INPUT);
-    }
+//  //Disabled due to stomping    
+//    for (i=0;i<(sizeof(dc)/4);i++)
+//    {
+//      pinMode(dc[i],INPUT);
+//    }
+
+    pinMode(dc[0],INPUT);
+    pinMode(dc[1],INPUT);
+    pinMode(dc[2],INPUT);
+    pinMode(dc[3],INPUT);
 
     for (i=0;i<(sizeof(iMeas)/4);i++)
     {
@@ -335,12 +346,18 @@ void loop()
           }
         }
       }
-      else if (databuf[0]==AIN_DRIVE)   //AIN_DRIVE=4
+      else if (databuf[0]==AIN_DRIVE)   //AIN_DRIVE=4 (0-10V Drive)
       {
         Serial.println("0-10V Drive");
         Serial.print("0-10V Drive data = ");
         int i;
-        for (i=0;i<received;i++)
+        int numAin=received-1; //numAin is the number of analog inputs to update.  We don't have to do all of them...
+        if ((received-1)>(sizeof(ainDrive)/4)) //...but trying to update more than we have is bad.
+        {
+          Serial.println("We received too many bytes.  Smack Nick.");
+          numAin=(sizeof(ainDrive)/4);
+        }
+        for (i=0;i<numAin;i++) //Received count is equal to the command plus all of its arguments.  "received-1" strips the command byte
         {
           Serial.print("i = ");
           Serial.print(i);
@@ -473,12 +490,12 @@ void requestEvent(void)
       result*=2;  // left shift 1
       if (digitalRead(dc[i])==HIGH) result+=1;
     }
-    
+    Serial.println("");
     databuf[0]=1;
     databuf[1]=result;
-//    Serial.println("Get dry contact =  ");
-//    Serial.print("Result = ");
-//    Serial.println(result);
+    Serial.println("Get dry contact =  ");
+    Serial.print("Result = ");
+    Serial.println(result);
   }
   if (addr==IMEAS)                // 7
   {     
