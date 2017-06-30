@@ -42,7 +42,7 @@
 // (7) started commenting/refactoring code for readability
 //-------------------------------------------------------------------------------------
 #define RELEASENUMBERMAJOR 0
-#define RELEASENUMBERMINOR 5
+#define RELEASENUMBERMINOR 6
 #define LV_HV 0 //LV=0, HV=1
 #include <i2c_t3.h>
 
@@ -56,6 +56,7 @@
 //-------------------------------------------------------------------------------------
 void receiveEvent(size_t count);  // I2C Receive event handler (count = numBytesRxd)
 void requestEvent(void);          // I2C Request data event handler
+
 
 //-------------------------------------------------------------------------------------
 // Memory
@@ -122,15 +123,54 @@ const int iMeas[] = {A14,A15,A16,A17,A18,A19,A20,A21};  // Current sense
 const int n_iMeas = 8;
 
 uint8_t ignoreLastRx=0;                                 // ***
-uint8_t databuf[MEM_LEN];                               // databuf[256] - i2c data
 volatile uint8_t received;                              // ***
-uint8_t addr;                                           // ***
 int dimmer0_10Vmode = 0x00;                             // ***
 int dimmerEdge = 0x00;                                  // ***
 uint8_t dimmerRelayState = 0x00;                        // ***
 uint16_t pwmData[] = {0x0000,0x0000,0x0000,0x0000,      // ***
                       0x0000,0x0000,0x0000,0x0000};
 
+
+
+#define QUEUE_SIZE 10
+// NGP addons
+// que for set commands 
+uint8_t queue2[QUEUE_SIZE][200];
+int front = 0, rear = 0;
+void enQueue(uint8_t * data, int length);
+void deQueuebuff(uint8_t * rxdata);
+
+void TxVersionInfo(); // sends out version info, util func. 
+
+// methods for measurements
+void MeasureWetDryContactInputs();
+void MeasureZero2TenInputs();
+void MeasurePWMCurrent();  // take pwm current measurment
+
+// measurment data holders / current status holders
+uint8_t pwmcurrentstatus[17]; // pwm current (for power)
+uint8_t zero2teninputstatus[9]; // zero to 2 input (analog)
+uint8_t wetdrycontactstatus[2]; // wd contact (binary)
+
+// routines for set hw 
+void setOutputPolarity(uint8_t mode);
+void setZero2TenVoltDrive(uint8_t * drivebuff);
+void setPLCState(uint8_t stateval);
+void setPWMState(uint8_t * pwmvals);
+void setHVDimMode(uint8_t dimmode);
+
+
+volatile long loopcount = 0;  //debug only 
+
+
+byte pending_get_command = 0xff;
+
+
+//void printdebug(char* str, int flag)
+//{
+//    if(flag)
+//        Serial.print(str);
+//}
 //-------------------------------------------------------------------------------------
 // Setup
 //-------------------------------------------------------------------------------------
@@ -193,8 +233,7 @@ void setup()
    
  // Data init
     received = 0;
-    memset(databuf, 0, sizeof(databuf));  // /4 
- 
+  
     Serial.begin(115200);
     Serial.println("Teensy Setup has run! We've Booted!");
         
@@ -216,14 +255,13 @@ void setup()
     
  // Write shiftreg
     shiftRegisterWriteWord(0x0001);
-    
-
+   
   // Test Feather / Soft Reboot
      //softReboot();
 
   // Test Hammer / Hard Reboot
      //hardReboot();
-
+     Serial.println("loop start");
 }
 
 void loop()
@@ -241,148 +279,63 @@ void loop()
 // rebootResolveI2C(void): failsafe reboot mode
 //-------------------------------------------------------------------------------------
 {
-  if (EnableFailSafeReboot == true && millis()-bootUpMillis > 45000)
-  {
-    if (bootTimeWaitDone == false)
-    {
-      Serial.println("**************************");
-      Serial.println("45s elapsed from uC bootup");
-      Serial.println("**************************");
-      bootTimeWaitDone = true;
-    }
-    rebootResolveI2C();   // Check I2C, enter soft/hard reboot routine if necessary
-  }
+     uint8_t rxdata[200];      // used for pulling in latest from queue. 
+           
+     memset(rxdata, 0, sizeof(rxdata));  // /4 
+  
+      loopcount++;
+      if(loopcount == 200)
+      {
+         loopcount = 0;
+        // Serial.println("loop rollover");
+      }
 
-  if (ignoreLastRx==0)
-  {
-    if(received)        // initialized to zero in setup; received = # of bytes rx'd
-    {
-      Serial.println("***Received SET Command***");
-      //--------------------------------------------------------
-      // Determine mode of operation then execute accordingly
-      // PWMSET    = 1  ->    
-      // PLC       = 2  -> 
-      // OPOL      = 3  -> Set PWM Polarity
-      // AIN_DRIVE = 4  -> 
-      // HVDIMMODE = 8  -> 
-      //--------------------------------------------------------
-      if (databuf[0]==PWMSET)   //PWMSET=1
+      deQueuebuff(rxdata);  // dequeue from set que,  is anything incomming, 
+
+       // if valid data from queue,  process it, 
+       // *********************************************************
+      if(rxdata[0] != 0xff)
       {
-        Serial.println("PWM");
-        Serial.print("PWM data = ");
-        int i;
-        for (i=0;i<(received/2);i++)
-        {
-          Serial.print("i = ");
-          Serial.print(i);
-          Serial.print(" data = ");
-          int pwmValue=databuf[(2*i)+1]*256+databuf[(2*i)+2];
-          Serial.println(pwmValue);
-          pwmData[i]=pwmValue;
-          analogWrite(pwmPin[i],pwmValue);
-        }
-        if (LV_HV == 1) //HV mode
-        {
-          relayUpdate();
-        }
-      }
-      else if (databuf[0]==PLC)     //PLC=2
-      {
-        Serial.print("PLC\n");
-        uint8_t plcData=databuf[1];
-        Serial.print("PLC data= ");
-        Serial.print(plcData);
-        Serial.print("\n\n");
-        for (int i=0;i<4;i++)
-        {
-          int state;
-          if ((plcData&0x01)>0)
+          // Serial.print("valid data ");
+          //Serial.println(rxdata[0]);
+          switch(rxdata[0])
           {
-            state=HIGH;
-          }
-          else
-          {
-            state=LOW;
-          }
-          digitalWrite(pSource[i],state);
-          plcData/=2;
-          
-        }
+             case 0x01:
+                setPWMState(rxdata);                 
+             break;
+             case 0x02:
+               setPLCState(rxdata[1]);
+               break;
+             case 0x03:
+               setOutputPolarity(rxdata[1]);
+             break;
+             case 0x04:
+               setZero2TenVoltDrive(rxdata);
+               break;
+             case 0x08:
+                setHVDimMode(rxdata[1]);
+               break;
+            default:
+            break;
+          }// end switch 
       }
-      else if (databuf[0]==OPOL)  //OPOL=3
+      else
       {
-        if (LV_HV==0)
-        {
-          Serial.print("Output Polarity\n");
-          uint8_t opolData=databuf[1];
-          Serial.print("Output Polarity data= ");
-          Serial.print(opolData);
-          Serial.print("\n\n");
-          shiftRegisterWriteByte(opolData);
-        }
-        else //High-voltage mode
-        {
-          int oldDimmerEdge=dimmerEdge;
-          dimmerEdge=databuf[1];
-          int newDimmerEdge=dimmerEdge;
-          Serial.print("Last dimmer edge = ");
-          Serial.println(oldDimmerEdge,HEX);
-          Serial.print("New dimmer edge = ");
-          Serial.println(newDimmerEdge,HEX);
-          int i;
-          for (i=0;i<8;i++)
-          {
-            if ((newDimmerEdge&0x00000001) != (oldDimmerEdge&0x00000001))
-            {
-              Serial.print("Dimmer ");
-              Serial.print(i);
-              Serial.println(" changed!");
-              set0_10V(i,0);
-              delay(100);
-              set0_10V(i,1);
-            }
-            newDimmerEdge>>=1;
-            oldDimmerEdge>>=1;
-          }
-        }
+        // Serial.println("nothing in set queue");
+        // do nothing ,  nothing to process from i2c 
       }
-      else if (databuf[0]==AIN_DRIVE)   //AIN_DRIVE=4 (0-10V Drive)
-      {
-        Serial.println("0-10V Drive");
-        Serial.print("0-10V Drive data = ");
-        int i;
-        int numAin=received-1; //numAin is the number of analog inputs to update.  We don't have to do all of them...
-        if ((received-1)>(sizeof(ainDrive)/4)) //...but trying to update more than we have is bad.
-        {
-          Serial.println("We received too many bytes.  Smack Nick.");
-          numAin=(sizeof(ainDrive)/4);
-        }
-        for (i=0;i<numAin;i++) //Received count is equal to the command plus all of its arguments.  "received-1" strips the command byte
-        {
-          Serial.print("i = ");
-          Serial.print(i);
-          Serial.print(" data = ");
-          int driveValue=databuf[i+1]*256;
-          Serial.println(driveValue);
-          analogWrite(ainDrive[i],driveValue);
-        }
-      }
-      else if (databuf[0]==HVDIMMODE)   //HVDIMMODE=8
-      {
-        hvDimMode(databuf[1]);
-        Serial.println("HVDIMMODE");
-      }
-    } // End if(ignoreLastRx==0)
-    received = 0;
-    //Serial.println("Received = 0");
-  }
+
+
+     // measurement routines 
+     MeasurePWMCurrent();
+     MeasureZero2TenInputs();
+     MeasureWetDryContactInputs();
+   
 } // end main loop()
 
 //-------------------------------------------------------------------------------------
 // Define Helper Functions
 //-------------------------------------------------------------------------------------
-
-void receiveEvent(size_t count)     
 // ------------------------------------------
 // Node set command received:
 // handle Rx Event (incoming I2C data)
@@ -390,66 +343,24 @@ void receiveEvent(size_t count)
 // ReceivedAnyI2cFromPi - setup as false. Set to true when first i2c starts
 // timeStampMostRecentRx = 0
 // ------------------------------------------
-{                                   
-    // ------------------------------------------------------
-    // Debugging for packet reception
-    // ------------------------------------------------------
-    if (ReceivedAnyI2cFromPi == false) // 1st packet received   
-    {
-      nTimeStampMostRecentRx = millis();                                    // If we get an rx it become the most recent
-      nTimeStampPriorRx = nTimeStampMostRecentRx;   // no delta yet
-      ReceivedAnyI2cFromPi = true;
-//      Serial.println("First i2c packet received!");      
-    }
-    else // > 1st packet received
-    {
-      nTimeStampPriorRx = nTimeStampMostRecentRx;  // last rx = prior
-      nTimeStampMostRecentRx = millis();           // this rx = most recent
-      nTimeDeltaRx = nTimeStampMostRecentRx - nTimeStampPriorRx;
-      if (nTimeDeltaRx > 10) // filter out false positives
+void receiveEvent(size_t count)     
+{      
+      uint8_t rxBuff[50];
+      
+      for (int i=0;i<count;i++)
       {
-        timeStampMostRecentRx = nTimeStampMostRecentRx; // "passed" to main
-//        Serial.println("Got another i2c packet!");
-//        Serial.print("Received at t=");
-//        Serial.println(timeStampMostRecentRx);
-//        Serial.print("Time delta from previous =");
-//        Serial.println(nTimeDeltaRx);
-        if (nTimeDeltaRx < 1000)
-        {
-          softRebootTryNum = 0;
-//          Serial.print("Resetting softRebootTryNum = ");
-//          Serial.println(softRebootTryNum);
-        }
+        rxBuff[i] = Wire.readByte(); // copy data to mem
       }
-    }      
- 
-    size_t idx=0;   // unsigned int >= 16-bit
-    if (count>1)    // If data has already been received (initialize to zero in setup)
-    {
-      while(idx < count)
+   
+      // for get commands don't put into que,  just process straight
+      if(rxBuff[0] == IMEAS || rxBuff[0] == AIN || 
+      rxBuff[0] == DRY_CONTACT || rxBuff[0]==VERSION)
       {
-        if(idx < MEM_LEN)                     // drop data beyond mem boundary
-            databuf[idx++] = Wire.readByte(); // copy data to mem
-        else
-            Wire.readByte();                  // drop data if mem full
+         pending_get_command = rxBuff[0];
       }
-      Serial.print("Receive Event byte count = ");
-      Serial.println(count);
-      Serial.print("Data= ");
-      for (int i=0;i<16;i++)
-      {
-        Serial.print(databuf[i]);
-        Serial.print(" ");
-      }
-      Serial.println();
-      received = count;
-    }
-    else      // If data has not been received
-    {
-      addr=Wire.readByte();
-//      Serial.print("Requested to send from address ");
-//      Serial.println(addr);
-    }
+      else      
+         enQueue(rxBuff, count);  // queue as set command 
+    
 } // end receive event handler
 
 
@@ -461,67 +372,29 @@ void requestEvent(void)
 // addr = command byte requested by Node i2c
 // ------------------------------------------
 {
-  if (addr==VERSION)              // 0 - Send Firmware Version Info
+ 
+  
+  if (pending_get_command==VERSION)              // 0 - 
+      TxVersionInfo();
+      
+  if(pending_get_command == IMEAS)
+      Wire.write(pwmcurrentstatus, 17);
+
+  if(pending_get_command == AIN)
   {
-    databuf[0]=3;
-    databuf[1]=LV_HV;
-    databuf[2]=RELEASENUMBERMAJOR;
-    databuf[3]=RELEASENUMBERMINOR;
+     // Serial.println("got zero 2 ten request");
+      Wire.write(zero2teninputstatus, 9);
   }
-  if (addr==AIN)                  // 5 -
+
+  if(pending_get_command == DRY_CONTACT)
   {
-    //Serial.println("AIN");
-    databuf[0]=8;
-    for (int i=0;i<4;i++)
-    {
-      int data=analogRead(analogIn[i]);
-      databuf[(2*i)+1]=char(data/256);
-      databuf[(2*i)+2]=char(data&0xFF);
-    }
+      // Serial.println("got wd request");
+      Wire.write(wetdrycontactstatus, 2);
   }
-  if (addr==DRY_CONTACT)           // 6
-  {
-    //read #4
-    //if 1 add 1 to result and left shift
-    //
-    int result=0;
-    for (int i=3;i>=0;i--)
-    {
-      result*=2;  // left shift 1
-      if (digitalRead(dc[i])==HIGH) result+=1;
-    }
-    Serial.println("");
-    databuf[0]=1;
-    databuf[1]=result;
-    Serial.println("Get dry contact =  ");
-    Serial.print("Result = ");
-    Serial.println(result);
-  }
-  if (addr==IMEAS)                // 7
-  {     
-    databuf[0]=16;
-    int count=0;
-    long data[8]={0,0,0,0,0,0,0,0};
-    elapsedMicros t=0;
-    while (t<5000)
-    {
-      for (int i=0;i<8;i++)
-      {
-        digitalWrite(1,HIGH);
-        data[i]+=analogRead(iMeas[i]);
-        digitalWrite(1,LOW);
-      }
-      count++;
-    }
-//    Serial.println(count);
-    for (int i=0;i<8;i++)
-    {
-//      data[i]*=256;
-      data[i]/=count;
-      databuf[(2*i)+1]=char(data[i]/256);
-      databuf[(2*i)+2]=char(data[i]&0xFF);
-    }
-  }
+
+  pending_get_command = 0xff; // clear it 
+
+/*  still to do for hv board ----------------------------------------<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<< to do . 
 //  if (addr==VIN)                // 9
 //  {
 //    databuf[0]=2;
@@ -531,6 +404,8 @@ void requestEvent(void)
 //    databuf[2]=char(data&0xFF);
 //  }
   Wire.write(databuf, MEM_LEN); // fill Tx buffer (send full mem)
+    */
+  
 }
 
 void setDimmerEdge(int dimmer,int edge)
@@ -735,21 +610,252 @@ void rebootResolveI2C(void)
   }    
 }
 
-//int arrayLen(####) 
-//// ------------------------------------------------
-//// return # of element in ####
-//// ------------------------------------------------
-//{
-//    not implemented
-//}
 
-//void printConfig(void)
-//// ------------------------------------------------
-//// Print channels and config received for each channel
-//// Teensy High connnects RPi Run low through Mosfet
-//// ------------------------------------------------
-//{
-//  not implemented
-//}
+void enQueue(uint8_t * data, int length){
+  
+    // Serial.print("EnQUE ");
+   /* if(data[0] == 1)
+    {
+         Serial.println("EnQUE ");
+        for(int j = 0 ; j < 9 ;j++)
+        {
+            Serial.print(data[j]);
+            Serial.print(" | ");
+        }
+    }  */
+       
+     memcpy(queue2[rear], data, length); 
+   
+     rear++;
+     if(rear >= QUEUE_SIZE-1)
+       rear = 0;
+
+
+    //if(data[0] == 1)
+      //    printQueue();
+     // Serial.print(front);
+}
+
+
+void printQueue()
+{
+     for(int i = 0 ; i < 10; i++)
+     {
+           Serial.print(i);
+           Serial.print(" --- ");
+            for(int j = 0 ; j < 20 ;j++)
+        {
+            Serial.print(queue2[i][j]);
+            Serial.print(" | ");
+        }
+        Serial.println(" ");
+        
+     }
+}
+
+void deQueuebuff(uint8_t * rxdata){
+
+   if(front == rear)
+   {
+      rxdata[0] = 0xff;
+      return; 
+   }
+   else{
+
+   // Serial.print("DQ  ");  
+   // Serial.println(front);
+   // Serial.println(rear);
+      
+     // Serial.print("got valid buffer data"); 
+     // Serial.println(front);
+      
+      memcpy(rxdata, queue2[front], 200);   
+
+      memset(queue2[front],0xFF,200);
+       
+      front++;
+      if(front >= QUEUE_SIZE-1)
+          front = 0;
+    
+
+      return; 
+   }
+}
+
+
+void MeasureWetDryContactInputs()
+{
+    int result=0;
+    for (int i=3;i>=0;i--)
+    {
+      result*=2;  // left shift 1
+      if (digitalRead(dc[i])==HIGH) result+=1;
+    }
+    wetdrycontactstatus[0]=1;   //length
+    wetdrycontactstatus[1]=result;     
+}
+
+void TxVersionInfo()
+{
+    uint8_t txbuff[4];
+    Serial.println("got version request, sending now" );
+    txbuff[0]=3;
+    txbuff[1]=LV_HV;
+    txbuff[2]=RELEASENUMBERMAJOR;
+    txbuff[3]=RELEASENUMBERMINOR;
+    Wire.write(txbuff, 4);
+}
+
+
+void MeasureZero2TenInputs()
+{
+  int tempdata = 0;
+   memset(zero2teninputstatus,0,sizeof(zero2teninputstatus));
+    zero2teninputstatus[0]=8;
+
+    tempdata=analogRead(analogIn[0]);            
+    zero2teninputstatus[1]=(uint8_t)(tempdata >> 8)&0xFF;
+    zero2teninputstatus[2]=(uint8_t)(tempdata&0xFF);
+   
+    tempdata=analogRead(analogIn[1]);
+    zero2teninputstatus[3]=(uint8_t)(tempdata >> 8)&0xFF;
+    zero2teninputstatus[4]=(uint8_t)tempdata&0xFF;
+    tempdata=analogRead(analogIn[2]);     
+    zero2teninputstatus[5]=(uint8_t)(tempdata >> 8)&0xFF;
+    zero2teninputstatus[6]=(uint8_t)(tempdata&0xFF);
+     
+    tempdata=analogRead(analogIn[3]);
+    zero2teninputstatus[7]=(uint8_t)(tempdata >> 8)&0xFF;
+    zero2teninputstatus[8]=(uint8_t)(tempdata&0xFF);
+}
+
+
+void MeasurePWMCurrent()
+{
+ long data[8]={0,0,0,0,0,0,0,0};  
+   int count = 0; 
+   
+    elapsedMicros t=0;
+    while (t<5000)
+    {
+        for (int i=0;i<8;i++)
+        {
+          //digitalWrite(1,HIGH);
+          data[i]+=analogRead(iMeas[i]);
+          //digitalWrite(1,LOW);
+        }
+        count++; //for div
+    }  
+
+    memset(pwmcurrentstatus,0,sizeof(pwmcurrentstatus));
+    pwmcurrentstatus[0]=16;
+    for (int i=0;i<8;i++)
+    { 
+      data[i]/=count;
+      pwmcurrentstatus[(2*i)+1]=char(data[i]/256);
+      pwmcurrentstatus[(2*i)+2]=char(data[i]&0xFF);
+    }
+}
+
+
+void setOutputPolarity(uint8_t mode)
+{
+   if (LV_HV==0)
+    {
+      Serial.print("Output Polarity\n");
+      uint8_t opolData=mode;
+      Serial.print("Output Polarity data= ");
+      Serial.print(opolData);
+      Serial.print("\n\n");
+      shiftRegisterWriteByte(opolData);
+    }
+    else //High-voltage mode
+    {
+      int oldDimmerEdge=dimmerEdge;
+      dimmerEdge=mode;
+      int newDimmerEdge=dimmerEdge;
+      Serial.print("Last dimmer edge = ");
+      Serial.println(oldDimmerEdge,HEX);
+      Serial.print("New dimmer edge = ");
+      Serial.println(newDimmerEdge,HEX);
+      int i;
+      for (i=0;i<8;i++)
+      {
+        if ((newDimmerEdge&0x00000001) != (oldDimmerEdge&0x00000001))
+        {
+          Serial.print("Dimmer ");
+          Serial.print(i);
+          Serial.println(" changed!");
+          set0_10V(i,0);
+          delay(100);
+          set0_10V(i,1);
+        }
+        newDimmerEdge>>=1;
+        oldDimmerEdge>>=1;
+      }
+    }
+}
+
+
+
+void setZero2TenVoltDrive(uint8_t * drivebuff)
+{
+
+   // Serial.println("0-10V Drive");
+   // Serial.print("0-10V Drive data = ");
+    int i;
+    int numAin=received-1; //numAin is the number of analog inputs to update.  We don't have to do all of them...
+    if ((received-1)>(sizeof(ainDrive)/4)) //...but trying to update more than we have is bad.
+    {
+      Serial.println("We received too many bytes.  Smack Nick.");
+      numAin=(sizeof(ainDrive)/4);
+    }
+    
+    for (i=0;i<numAin;i++) //Received count is equal to the command plus all of its arguments.  "received-1" strips the command byte
+    {
+    //  Serial.print("i = ");
+    //  Serial.print(i);
+    //  Serial.print(" data = ");
+      int driveValue=drivebuff[i+1]*256;
+    //  Serial.println(driveValue);
+      analogWrite(ainDrive[i],driveValue); 
+   }
+}
+void setPLCState(uint8_t stateval)
+{
+  //  Serial.print("PLC data= ");
+   // Serial.println(stateval);
+    for (int i=0;i<4;i++)
+    {
+        if(  ( (stateval >> i) & 0x01) > 0)
+            digitalWrite(pSource[i],HIGH);
+        else
+            digitalWrite(pSource[i],LOW);
+    }
+}
+
+void setPWMState(uint8_t * pwmvals)
+{
+  // Serial.print("pwmvals: ");
+   for(int i = 0; i < 8; i++)
+   {
+      int pwmValue=pwmvals[(2*i)+1]*256+pwmvals[(2*i)+2];
+      int pct = (pwmValue*100)/65535;
+    //  Serial.print(pwmValue);
+   //    Serial.print(pct);
+    //  Serial.print(" | ");
+    
+      pwmData[i]=pwmValue; // store value for ref 
+      analogWrite(pwmPin[i],pwmValue);
+   }
+
+  // Serial.println("");
+}
+
+void setHVDimMode(uint8_t dimmode)
+{
+      Serial.println("HVDIMMODE");  
+      hvDimMode(dimmode);  
+}
 
 
