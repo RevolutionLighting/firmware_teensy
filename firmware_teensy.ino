@@ -1,6 +1,15 @@
 //-------------------------------------------------------------------------------------
 // Revolution Lighting Project Firmware
 //-------------------------------------------------------------------------------------
+// Version 0.7
+// Code reworked to accomodate RL0005 Rev.B and RL0003 Rev.C
+// shiftRegister code and associated calls reworked to accomodate new HW
+//  
+// Version 0.6
+// Nick's FIFO Queue implemented for get commands
+// Set command implementations broken out into separate functions
+// Serial.print code updated
+//
 // Version 0.5
 // (1) fixed bug in AIN_Drive set command which caused dry contact #1 input to be
 //     corrupted, i.e. stuck on logic 1
@@ -42,8 +51,8 @@
 // (7) started commenting/refactoring code for readability
 //-------------------------------------------------------------------------------------
 #define RELEASENUMBERMAJOR 0
-#define RELEASENUMBERMINOR 6
-#define LV_HV 0 //LV=0, HV=1
+#define RELEASENUMBERMINOR 7
+#define LV_HV 1 //LV=0, HV=1
 #include <i2c_t3.h>
 
 //-------------------------------------------------------------------------------------
@@ -147,7 +156,7 @@ void MeasureWetDryContactInputs();
 void MeasureZero2TenInputs();
 void MeasurePWMCurrent();  // take pwm current measurment
 
-// measurment data holders / current status holders
+// measurement data holders / current status holders
 uint8_t pwmcurrentstatus[17]; // pwm current (for power)
 uint8_t zero2teninputstatus[9]; // zero to 2 input (analog)
 uint8_t wetdrycontactstatus[2]; // wd contact (binary)
@@ -254,7 +263,7 @@ void setup()
     delay(1000);  // wait 1 sec for i2c to start before main loop
     
  // Write shiftreg
-    shiftRegisterWriteWord(0x0001);
+    shiftRegisterWriteWord16(0x0001);
    
   // Test Feather / Soft Reboot
      //softReboot();
@@ -296,8 +305,8 @@ void loop()
        // *********************************************************
       if(rxdata[0] != 0xff)
       {
-          // Serial.print("valid data ");
-          //Serial.println(rxdata[0]);
+          Serial.print("valid data received; command byte = ");
+          Serial.println(rxdata[0]);
           switch(rxdata[0])
           {
              case 0x01:
@@ -414,6 +423,7 @@ void setDimmerEdge(int dimmer,int edge)
 // edge = 
 // ------------------------------------------
 {
+  Serial.println("");
   Serial.print("Set dimmer edge dimmer =  ");
   Serial.print(dimmer);
   Serial.print("edge = ");
@@ -437,6 +447,7 @@ void set0_10V(int dimmer, int mode)
 // relayUpdate()
 // ------------------------------------------
 {
+  Serial.println("");
   Serial.print("Set 0_10V mode dimmer =  ");
   Serial.print(dimmer);
   Serial.print(" mode = ");
@@ -444,10 +455,12 @@ void set0_10V(int dimmer, int mode)
   if (mode==0)
   {
     dimmer0_10Vmode &= ~(0x01<<dimmer);
+    dimmerRelayState &= ~(0x01<<dimmer);
   }
   else
   {
     dimmer0_10Vmode |= 0x01<<dimmer;
+    dimmerRelayState |= 0x01<<dimmer;
   }
   relayUpdate();
 }
@@ -457,14 +470,35 @@ void updateHVSR(void)
 // dimmerEdge
 // dimmerRelayState
 // outputWord
-// shiftRegisterWriteWord()
+// shiftRegisterWriteWord16()
 // ------------------------------------------
 {
-  int outputWord = ((dimmerEdge&0xF0)<<8)+((dimmerRelayState&0xF0)<<4)+((dimmerEdge&0x0F)<<4)+(dimmerRelayState&0x0F);
-//  int outputWord = ((dimmerEdge&0x0F)<<12)+((dimmerRelayState&0x0F)<<8)+((dimmerEdge&0xF0))+((dimmerRelayState&0xF0)>>4);
-  Serial.print("Update HVSR with ");
-  Serial.println(outputWord,HEX);
-  shiftRegisterWriteWord(outputWord);
+    Serial.println("");
+    Serial.println("UpdateHVSR() called");
+    Serial.print("LV_HV = ");
+    Serial.println(LV_HV);
+    if (LV_HV==0)
+    {   
+        // LV Board
+        // One 8-bit shift register
+        // constructing serial stream being send to shift registers
+        //               (mask off bottom 4 bits
+        int outputWord = ((dimmerEdge&0xF0)<<8)+((dimmerRelayState&0xF0)<<4)+((dimmerEdge&0x0F)<<4)+(dimmerRelayState&0x0F);
+        // int outputWord = ((dimmerEdge&0x0F)<<12)+((dimmerRelayState&0x0F)<<8)+((dimmerEdge&0xF0))+((dimmerRelayState&0xF0)>>4);
+        Serial.println("");
+        Serial.print("Update HVSR with 16 bit value ");
+        Serial.println(outputWord,HEX);
+        shiftRegisterWriteWord16(outputWord);
+    }
+    if (LV_HV==1)
+    {
+//        int outputWord = ((dimmerEdge&0xF0)<<8)+((dimmerRelayState&0xF0)<<4)+((dimmerEdge&0x0F)<<4)+(dimmerRelayState&0x0F);
+        int outputWord = (0x03<<16)+((dimmerEdge&0xF0)<<8)+((dimmerRelayState&0xF0)<<4)+((dimmerEdge&0x0F)<<4)+((dimmerRelayState&0x0F));
+        Serial.println("");
+        Serial.print("Update HVSR with 24 bit value ");
+        Serial.println(outputWord,HEX);
+        shiftRegisterWriteWord24(outputWord);
+    }
 }
 
 void hvDimMode (uint8_t data)
@@ -472,6 +506,7 @@ void hvDimMode (uint8_t data)
 // dimmer0_10Vmode
 // ------------------------------------------
 {
+  Serial.println("");
   Serial.println("HV Dim Mode");
   Serial.print("HV Dim Mode data = ");
   Serial.println(data,HEX);
@@ -490,13 +525,13 @@ void relayUpdate(void)
 {
   int i;
   int8_t mask = 0x01;
+  Serial.println("");
   Serial.println("Relay Update");
   for (i=0;i<8;i++)  //Don't want to update all the relays at once!
   {
     bool inDimMode=((dimmer0_10Vmode&mask)!=0);
     bool pwmIsZero=(pwmData[i]==0x0000);
-    //Serial.print("If statement = ");
-    Serial.print("dimmerRelayState= ");
+    Serial.print("dimmerRelayState = ");
     Serial.print(dimmerRelayState,HEX);
     Serial.print(" inDimMode=");
     Serial.print(inDimMode);
@@ -504,18 +539,18 @@ void relayUpdate(void)
     Serial.println(pwmIsZero);
     if (inDimMode || pwmIsZero) //if channel in (phase-dim-mode) or (PWM is zero) then we need to open the relay.
     {
-      if ((dimmerRelayState&mask)==0) //The relay was previously closed, we need to open it
+      if ((dimmerRelayState&mask)!=0) //The relay was previously closed, we need to open it
       {
-        dimmerRelayState|=mask;
+        dimmerRelayState&=~mask;
         updateHVSR();
         delay(100);
       }
     }
     else
     {
-      if ((dimmerRelayState&mask)!=0) //The relay was previously open, we need to close it
+      if ((dimmerRelayState&mask)==0) //The relay was previously open, we need to close it
       {
-        dimmerRelayState&=~mask;
+        dimmerRelayState|=mask;
         updateHVSR();
         delay(100);
       }      
@@ -786,9 +821,11 @@ void setOutputPolarity(uint8_t mode)
           Serial.print("Dimmer ");
           Serial.print(i);
           Serial.println(" changed!");
-          set0_10V(i,0);
+          dimmerRelayState |= 0x01<<i;
+          updateHVSR();
           delay(100);
-          set0_10V(i,1);
+          dimmerRelayState &= ~(0x01<<i);
+          updateHVSR();
         }
         newDimmerEdge>>=1;
         oldDimmerEdge>>=1;
@@ -804,7 +841,18 @@ void setZero2TenVoltDrive(uint8_t * drivebuff)
    // Serial.println("0-10V Drive");
    // Serial.print("0-10V Drive data = ");
     int i;
+
+    // 
+    //
+    received = sizeof(drivebuff)/sizeof(drivebuff[0]);
+    Serial.print("In setZero2TenVoltDrive function");
+    Serial.println("Length of drivebuff = ");
+    Serial.println(received);
+    
     int numAin=received-1; //numAin is the number of analog inputs to update.  We don't have to do all of them...
+
+    Serial.print("received = ");
+    Serial.println (received);
     if ((received-1)>(sizeof(ainDrive)/4)) //...but trying to update more than we have is bad.
     {
       Serial.println("We received too many bytes.  Smack Nick.");
@@ -836,20 +884,24 @@ void setPLCState(uint8_t stateval)
 
 void setPWMState(uint8_t * pwmvals)
 {
-  // Serial.print("pwmvals: ");
+   Serial.print("pwmvals: ");
    for(int i = 0; i < 8; i++)
    {
       int pwmValue=pwmvals[(2*i)+1]*256+pwmvals[(2*i)+2];
       int pct = (pwmValue*100)/65535;
-    //  Serial.print(pwmValue);
-   //    Serial.print(pct);
-    //  Serial.print(" | ");
+      Serial.print(pwmValue);
+      Serial.print(pct);
+      Serial.print(" | ");
     
       pwmData[i]=pwmValue; // store value for ref 
       analogWrite(pwmPin[i],pwmValue);
    }
-
-  // Serial.println("");
+   if (LV_HV == 1)
+   {
+      relayUpdate();
+   }
+   Serial.println("");
+   Serial.println("");
 }
 
 void setHVDimMode(uint8_t dimmode)
