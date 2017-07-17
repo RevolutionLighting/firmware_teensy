@@ -1,7 +1,9 @@
 //-------------------------------------------------------------------------------------
 // Revolution Lighting Project Firmware
 //-------------------------------------------------------------------------------------
-// Version 0.7
+// V0.7 with RMS Current
+//
+// Version 0.7 
 // Code reworked to accomodate RL0005 Rev.B and RL0003 Rev.C
 // shiftRegister code and associated calls reworked to accomodate new HW
 //  
@@ -52,8 +54,13 @@
 //-------------------------------------------------------------------------------------
 #define RELEASENUMBERMAJOR 0
 #define RELEASENUMBERMINOR 7
-#define LV_HV 1 //LV=0, HV=1
+#define LV_HV 0 //LV=0, HV=1
 #include <i2c_t3.h>
+//#include <ArduinoSTL.h>
+
+boolean DebugRMSCurrent = true;
+boolean TestFlag = true;
+
 
 //-------------------------------------------------------------------------------------
 //  # of elements in array = total array length / size of each element
@@ -139,8 +146,39 @@ uint8_t dimmerRelayState = 0x00;                        // ***
 uint16_t pwmData[] = {0x0000,0x0000,0x0000,0x0000,      // ***
                       0x0000,0x0000,0x0000,0x0000};
 
+//-------------------------------------------------------------------------------------
+// *** RMS CURRENT Globals
+//-------------------------------------------------------------------------------------
+// configure current measurement details here:
+unsigned long samplesPerSec = 1000;                               //
+unsigned long windowLenSecs = 1;                                  // 1 second window len
+
+// Calculate sampling time period in mS => 1/samplesPerSec*1000    
+// unsigned long iSamplePeriod = (1/samplesPerSec)*1000;          // **this is returning 0 for some reason**
+unsigned long iSamplePeriod =1;                                   // so, do manual calculation instead
+
+// Allocate memory for iWindow array
+//const int len_iWindow = int(samplesPerSec*windowLenSecs);       // **This isn't casting to type int**
+//const int len_iWindow = (int)samplesPerSec*windowLenSecs;       // **same as above...**
+const int len_iWindow = 1000;                                     // so, do manual calculation instead
+long iWindow[ len_iWindow ];                                      //
+
+// temp variables
+long iWindowSum = 0;                    // for removing dc bias
+long iWindowAvg = 0;                    // for removing dc bias
+long iWindowPow2Sum = 0;                // for rms calc
+long iWindowPow2Mean = 0;               // for rms calc
+long iRMS = 0;                          // RMS current from window
+
+// sample timestamping
+unsigned long iTimeLastSample  = 0;     // time stamp of previous current meas.
+// data "returned" via this array
+long rmsCurrentArray[8] = {0, 0, 0, 0, 0, 0, 0, 0};   // this array store rms current
 
 
+//-------------------------------------------------------------------------------------
+// *** QUEUE Globals
+//-------------------------------------------------------------------------------------
 #define QUEUE_SIZE 10
 // NGP addons
 // que for set commands 
@@ -154,7 +192,8 @@ void TxVersionInfo(); // sends out version info, util func.
 // methods for measurements
 void MeasureWetDryContactInputs();
 void MeasureZero2TenInputs();
-void MeasurePWMCurrent();  // take pwm current measurment
+void MeasurePWMCurrent();   // take pwm current measurment
+void MeasureRMSCurrent(int chNum);  // 
 
 // measurement data holders / current status holders
 uint8_t pwmcurrentstatus[17]; // pwm current (for power)
@@ -174,12 +213,6 @@ volatile long loopcount = 0;  //debug only
 
 byte pending_get_command = 0xff;
 
-
-//void printdebug(char* str, int flag)
-//{
-//    if(flag)
-//        Serial.print(str);
-//}
 //-------------------------------------------------------------------------------------
 // Setup
 //-------------------------------------------------------------------------------------
@@ -270,6 +303,27 @@ void setup()
 
   // Test Hammer / Hard Reboot
      //hardReboot();
+
+  // Print RMS current measurement settings:
+//     printdebug("Testing Print Debug\n", DebugRMSCurrent);
+//     printdebug("RMS Current Sampling: Samples/Sec = ", DebugRMSCurrent);
+//     //printdebug(samplesPerSec, DebugRMSCurrent);
+//     printdebug("\n", DebugRMSCurrent);
+     
+     Serial.print("Window Len (sec) = ");
+     Serial.println(windowLenSecs);
+     Serial.println("");
+
+     Serial.print("Data points in iWindow[N] = ");
+     Serial.println(len_iWindow);
+     Serial.println("");
+     
+     Serial.print("Sample Period = ");
+     Serial.print(iSamplePeriod);
+     Serial.println(" mS");
+     Serial.println("");
+
+//     printf("This is my first time using arduino printf %f", 3.14);
      Serial.println("loop start");
 }
 
@@ -339,6 +393,16 @@ void loop()
      MeasurePWMCurrent();
      MeasureZero2TenInputs();
      MeasureWetDryContactInputs();
+
+     // RMS Current Sampling
+     // Note: iTimeLastSample intitialized to 0 in setup()
+     if ( (millis()-iTimeLastSample) >= iSamplePeriod )   // time to measure next sample?
+     {
+         for (int chNum=0; chNum<8; chNum++)
+         {
+              MeasureRMSCurrent(chNum);    // put scalar rms current value in: rmsCurrentArray[chNum]
+         }           
+     }
    
 } // end main loop()
 
@@ -910,4 +974,49 @@ void setHVDimMode(uint8_t dimmode)
       hvDimMode(dimmode);  
 }
 
+void MeasureRMSCurrent(int channelNum)
+{
+    iWindowSum = 0;
+    iWindowAvg = 0;
+    iWindowPow2Sum = 0;
+    iWindowPow2Mean = 0;
+    
+    memset(iWindow, 0, sizeof(iWindow)/sizeof(iWindow[0])); // not necessary but probably a good idea for debugging
+    
+    if(channelNum > 7)  // valid channels are 0-7
+    {
+        Serial.print("Warning! Trying to measure current for invalid channel #: ");
+        Serial.println(channelNum);
+    }
 
+    // Shift all data in the array left discard oldest data pt
+    for( int i=0; i <len_iWindow-1; i++ )
+    {
+        iWindow[i] = iWindow[i+1];
+        iWindowSum += iWindow[i];
+    }
+    // Meas new data pt, append to array
+    iWindow[ len_iWindow - 1 ] = analogRead(iMeas[channelNum]);  // new meas data to last element in array
+    iWindowSum += iWindow[ len_iWindow - 1 ];
+    iWindowAvg = iWindowSum / len_iWindow;
+    
+    // Remove DC component and calculate square
+    for( int i=0; i <len_iWindow; i++ )
+    {
+        iWindowPow2Sum += pow ( (iWindow[i] - iWindowAvg), 2);  //note double is same as float w/arduino
+    }
+    // Calculate RMS
+    iWindowPow2Mean = iWindowPow2Sum/len_iWindow;  
+    iRMS = sqrt(iWindowPow2Mean);
+    rmsCurrentArray[channelNum] = iRMS;
+    
+}
+
+void printdebug(char* str, int flag)
+{
+    if(flag)
+    {
+      Serial.print(str);
+    }
+        
+}
