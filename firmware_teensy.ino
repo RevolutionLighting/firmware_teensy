@@ -1,11 +1,15 @@
 //-------------------------------------------------------------------------------------
 // Revolution Lighting Project Firmware
 //-------------------------------------------------------------------------------------
-// V0.7 with RMS Current
+// Version 0.8 
+// Added function prototypes to aid in porting to .cpp
+// RMS Current measurement function implemented
+// RMS Current main loop function call logic implemented
+// Verified to compile and upload with Atmel Studio 7 w/Arduino plugin and Arduinio IDE
 //
 // Version 0.7 
-// Code reworked to accomodate RL0005 Rev.B and RL0003 Rev.C
-// shiftRegister code and associated calls reworked to accomodate new HW
+// Code reworked to accommodate RL0005 Rev.B and RL0003 Rev.C
+// shiftRegister code and associated calls reworked to accommodate new HW
 //  
 // Version 0.6
 // Nick's FIFO Queue implemented for get commands
@@ -25,7 +29,7 @@
 // -resolved 0-10v current sensing error
 // -added flag to disable/enable failsafe reboot code
 // -sped up teensy boot time removing 45s delay from setup()
-// (1) bugfix for analogIn pins (pinMode(xx, INPUT) for all analog in pins
+// (1) bug fix for analogIn pins (pinMode(xx, INPUT) for all analog in pins
 // (2) changed AnalogWriteFrequency to 10KHz to resolve current sense read error
 // (3) brokeout failsafe reboot code into a helper function rebootResolveI2C()
 // (4) removed 45s delay from setup()
@@ -53,14 +57,13 @@
 // (7) started commenting/refactoring code for readability
 //-------------------------------------------------------------------------------------
 #define RELEASENUMBERMAJOR 0
-#define RELEASENUMBERMINOR 7
+#define RELEASENUMBERMINOR 8
 #define LV_HV 0 //LV=0, HV=1
+#include <arduino.h>
 #include <i2c_t3.h>
-//#include <ArduinoSTL.h>
 
 boolean DebugRMSCurrent = true;
 boolean TestFlag = true;
-
 
 //-------------------------------------------------------------------------------------
 //  # of elements in array = total array length / size of each element
@@ -68,11 +71,37 @@ boolean TestFlag = true;
 #define NELEMS(x)  (sizeof(x) / sizeof((x)[0]))
 
 //-------------------------------------------------------------------------------------
-// Function prototypes for event handlers
+// Function prototypes
 //-------------------------------------------------------------------------------------
-void receiveEvent(size_t count);  // I2C Receive event handler (count = numBytesRxd)
-void requestEvent(void);          // I2C Request data event handler
+void receiveEvent(size_t count);
+void requestEvent(void);
+void setup(void);
+void loop(void);
+void setDimmerEdge(int dimmer,int edge);
+void set0_10V(int dimmer, int mode);
+void updateHVSR(void);
+void hvDimMode (uint8_t data);
+void relayUpdate(void);
+void softReboot(void);
+void hardReboot(void);
+void rebootResolveI2C(void);
+void enQueue(uint8_t * data, int length);
+void printQueue(void);
+void deQueuebuff(uint8_t * rxdata);
+void TxVersionInfo(void);  // sends out version info, util func.
 
+// methods for measurements
+void MeasureWetDryContactInputs(void);
+void MeasureZero2TenInputs(void);
+void MeasurePWMCurrent(void);   // take pwm current measurment
+void MeasureRMSCurrent(int chNum);  //
+
+// routines for set hw
+void setOutputPolarity(uint8_t mode);
+void setZero2TenVoltDrive(uint8_t * drivebuff);
+void setPLCState(uint8_t stateval);
+void setPWMState(uint8_t * pwmvals);
+void setHVDimMode(uint8_t dimmode);
 
 //-------------------------------------------------------------------------------------
 // Memory
@@ -145,7 +174,6 @@ int dimmerEdge = 0x00;                                  // ***
 uint8_t dimmerRelayState = 0x00;                        // ***
 uint16_t pwmData[] = {0x0000,0x0000,0x0000,0x0000,      // ***
                       0x0000,0x0000,0x0000,0x0000};
-
 //-------------------------------------------------------------------------------------
 // *** RMS CURRENT Globals
 //-------------------------------------------------------------------------------------
@@ -175,7 +203,6 @@ unsigned long iTimeLastSample  = 0;     // time stamp of previous current meas.
 // data "returned" via this array
 long rmsCurrentArray[8] = {0, 0, 0, 0, 0, 0, 0, 0};   // this array store rms current
 
-
 //-------------------------------------------------------------------------------------
 // *** QUEUE Globals
 //-------------------------------------------------------------------------------------
@@ -184,41 +211,18 @@ long rmsCurrentArray[8] = {0, 0, 0, 0, 0, 0, 0, 0};   // this array store rms cu
 // que for set commands 
 uint8_t queue2[QUEUE_SIZE][200];
 int front = 0, rear = 0;
-void enQueue(uint8_t * data, int length);
-void deQueuebuff(uint8_t * rxdata);
-
-void TxVersionInfo(); // sends out version info, util func. 
-
-// methods for measurements
-void MeasureWetDryContactInputs();
-void MeasureZero2TenInputs();
-void MeasurePWMCurrent();   // take pwm current measurment
-void MeasureRMSCurrent(int chNum);  // 
 
 // measurement data holders / current status holders
 uint8_t pwmcurrentstatus[17]; // pwm current (for power)
 uint8_t zero2teninputstatus[9]; // zero to 2 input (analog)
 uint8_t wetdrycontactstatus[2]; // wd contact (binary)
 
-// routines for set hw 
-void setOutputPolarity(uint8_t mode);
-void setZero2TenVoltDrive(uint8_t * drivebuff);
-void setPLCState(uint8_t stateval);
-void setPWMState(uint8_t * pwmvals);
-void setHVDimMode(uint8_t dimmode);
-
-
 volatile long loopcount = 0;  //debug only 
-
-
 byte pending_get_command = 0xff;
+//-------------------------------------------------------------------------------------
 
-//-------------------------------------------------------------------------------------
-// Setup
-//-------------------------------------------------------------------------------------
 void setup()
 {
- 
  // Configure Teensy Pins
     pinMode(1,OUTPUT);                // TP1
     pinMode(SR_CLK,OUTPUT);           // I2C clock
@@ -243,7 +247,6 @@ void setup()
       analogWrite(pwmPin[i] , 0);
     }
 
-    
 //  //Disabled due to stomping    
 //    for (i=0;i<(sizeof(dc)/4);i++)
 //    {
@@ -325,23 +328,23 @@ void setup()
 
 //     printf("This is my first time using arduino printf %f", 3.14);
      Serial.println("loop start");
-}
+}	// End setup()
 
 void loop()
-//-------------------------------------------------------------------------------------
-// Main Loop
-//-------------------------------------------------------------------------------------
-// EnableFailSafeReboot: true to enable failsafe reboot code, false to disable
-// timeStampMostRecentRx = Stamped by rx event hander when an rx event occurs
-// timeDeltaRx = time since last rx
-// rebootWaitTimeMillis: # of ms to wait for RPi to reboot
-// maxNumSoftRebootTries: hard reset when this # of softReboot tries exceeded
-// softRebootTryNum: iterator
-// softReboot(void)
-// hardReboot(void)
-// rebootResolveI2C(void): failsafe reboot mode
-//-------------------------------------------------------------------------------------
 {
+	//-------------------------------------------------------------------------------------
+	// Main Loop
+	//-------------------------------------------------------------------------------------
+	// EnableFailSafeReboot: true to enable failsafe reboot code, false to disable
+	// timeStampMostRecentRx = Stamped by rx event hander when an rx event occurs
+	// timeDeltaRx = time since last rx
+	// rebootWaitTimeMillis: # of ms to wait for RPi to reboot
+	// maxNumSoftRebootTries: hard reset when this # of softReboot tries exceeded
+	// softRebootTryNum: iterator
+	// softReboot(void)
+	// hardReboot(void)
+	// rebootResolveI2C(void): failsafe reboot mode
+	//-------------------------------------------------------------------------------------
      uint8_t rxdata[200];      // used for pulling in latest from queue. 
            
      memset(rxdata, 0, sizeof(rxdata));  // /4 
@@ -406,16 +409,6 @@ void loop()
    
 } // end main loop()
 
-//-------------------------------------------------------------------------------------
-// Define Helper Functions
-//-------------------------------------------------------------------------------------
-// ------------------------------------------
-// Node set command received:
-// handle Rx Event (incoming I2C data)
-// count = number of bytes received
-// ReceivedAnyI2cFromPi - setup as false. Set to true when first i2c starts
-// timeStampMostRecentRx = 0
-// ------------------------------------------
 void receiveEvent(size_t count)     
 {      
       uint8_t rxBuff[50];
@@ -436,16 +429,13 @@ void receiveEvent(size_t count)
     
 } // end receive event handler
 
-
-
 void requestEvent(void)
-// ------------------------------------------
-// Node GET Command received:
-// Teensy Tx Event (I2C data -> PI)
-// addr = command byte requested by Node i2c
-// ------------------------------------------
 {
- 
+ // ------------------------------------------
+ // Node GET Command received:
+ // Teensy Tx Event (I2C data -> PI)
+ // addr = command byte requested by Node i2c
+ // ------------------------------------------
   
   if (pending_get_command==VERSION)              // 0 - 
       TxVersionInfo();
@@ -482,35 +472,35 @@ void requestEvent(void)
 }
 
 void setDimmerEdge(int dimmer,int edge)
-// ------------------------------------------
-// dimmer = 
-// edge = 
-// ------------------------------------------
 {
-  Serial.println("");
-  Serial.print("Set dimmer edge dimmer =  ");
-  Serial.print(dimmer);
-  Serial.print("edge = ");
-  Serial.println(edge);
-  if (edge==0)
-  {
-    dimmerEdge &= ~(0x01<<dimmer);
-  }
-  else
-  {
-    dimmerEdge |= 0x01<<dimmer;
-  }
-  relayUpdate();
-}
+	// ------------------------------------------
+	// dimmer =
+	// edge =
+	// ------------------------------------------
+	Serial.println("");
+	Serial.print("Set dimmer edge dimmer =  ");
+	Serial.print(dimmer);
+	Serial.print("edge = ");
+	Serial.println(edge);
+	if (edge==0)
+	{
+		dimmerEdge &= ~(0x01<<dimmer);
+	}
+	else
+	{
+	    dimmerEdge |= 0x01<<dimmer;
+	}
+		relayUpdate();
+	}
 
 void set0_10V(int dimmer, int mode)
-// ------------------------------------------
-// dimmer
-// dimmer0_10Vmode
-// mode
-// relayUpdate()
-// ------------------------------------------
 {
+	// ------------------------------------------
+	// dimmer
+	// dimmer0_10Vmode
+	// mode
+	// relayUpdate()
+	// ------------------------------------------
   Serial.println("");
   Serial.print("Set 0_10V mode dimmer =  ");
   Serial.print(dimmer);
@@ -530,13 +520,13 @@ void set0_10V(int dimmer, int mode)
 }
 
 void updateHVSR(void)
-// ------------------------------------------
-// dimmerEdge
-// dimmerRelayState
-// outputWord
-// shiftRegisterWriteWord16()
-// ------------------------------------------
 {
+	// ------------------------------------------
+	// dimmerEdge
+	// dimmerRelayState
+	// outputWord
+	// shiftRegisterWriteWord16()
+	// ------------------------------------------
     Serial.println("");
     Serial.println("UpdateHVSR() called");
     Serial.print("LV_HV = ");
@@ -566,27 +556,28 @@ void updateHVSR(void)
 }
 
 void hvDimMode (uint8_t data)
-// ------------------------------------------
-// dimmer0_10Vmode
-// ------------------------------------------
 {
-  Serial.println("");
-  Serial.println("HV Dim Mode");
-  Serial.print("HV Dim Mode data = ");
-  Serial.println(data,HEX);
-  dimmer0_10Vmode=~data; //Fixme with Nick, logic inversion ... see ~
-}
+	// ------------------------------------------
+	// dimmer0_10Vmode
+	// ------------------------------------------
+	Serial.println("");
+	Serial.println("HV Dim Mode");
+	Serial.print("HV Dim Mode data = ");
+	Serial.println(data,HEX);
+	dimmer0_10Vmode=~data; //Fixme with Nick, logic inversion ... see ~
+	}
 
 void relayUpdate(void)
-// ------------------------------------------
-// ******
-// dimmerRelayState
-// inDimMode
-// mask
-// pwmIsZero
-// updateHVSR()
-// ------------------------------------------
 {
+	// ------------------------------------------
+	// ******
+	// dimmerRelayState
+	// inDimMode
+	// mask
+	// pwmIsZero
+	// updateHVSR()
+	// ------------------------------------------
+
   int i;
   int8_t mask = 0x01;
   Serial.println("");
@@ -624,12 +615,12 @@ void relayUpdate(void)
 }
 
 void softReboot(void)
-// ------------------------------------------
-// Pull RPi pin12/GPIO-18 High for 1 sec 
-// RPi pin12 has internal pulldown enabled
-// Informs RPi to run sudo shutdown -r now
-// ------------------------------------------
-{   delay(1000);
+{   
+	// ------------------------------------------
+	// Pull RPi pin12/GPIO-18 High for 1 sec
+	// RPi pin12 has internal pulldown enabled
+	// Informs RPi to run sudo shutdown -r now
+	// ------------------------------------------delay(1000);
     Serial.println("Soft Reboot RPi!");
     Serial.println("PI_GPIO18_PIN12 toggle for 1 sec");
     digitalWrite(PI_GPIO18_PIN12, HIGH);                 
@@ -641,12 +632,12 @@ void softReboot(void)
 }
 
 void hardReboot(void)
-// ------------------------------------------------
-// Pull RPi Run low for 1 sec to reset/reboot
-// Teensy High connnects RPi Run low through Mosfet
-// ------------------------------------------------
 {
-    Serial.println("*****************************");
+	// ------------------------------------------------
+	// Pull RPi Run low for 1 sec to reset/reboot
+	// Teensy High connnects RPi Run low through Mosfet
+	// ------------------------------------------------
+    Serial.println("*****************************");	
     Serial.println("Hard Reboot RPi!");
     Serial.println("*****************************");
     Serial.println("PI_RUN toggle for 1 sec");
@@ -660,17 +651,17 @@ void hardReboot(void)
 }
 
 void rebootResolveI2C(void)
-//------------------------------------------------------------------------------
-// FAILSAFE MODE - REBOOT CODE TO RESOLVE I2C FAILURE
-//------------------------------------------------------------------------------
-// This block ensures that Teensy is receving i2c data from RPi
-// Cases: (1) rx data has been received w/i 1s
-//            1.1 do nothing
-//        (2) rx data has Not been received in last sec
-//            2.1 soft reboot (up to maxNumSoftRebootTries)
-//            2.2 hard reboot if soft reboot tries exceeds maxNumSoftRebootTries
-//------------------------------------------------------------------------------
 {
+	//------------------------------------------------------------------------------
+	// FAILSAFE MODE - REBOOT CODE TO RESOLVE I2C FAILURE
+	//------------------------------------------------------------------------------
+	// This block ensures that Teensy is receving i2c data from RPi
+	// Cases: (1) rx data has been received w/i 1s
+	//            1.1 do nothing
+	//        (2) rx data has Not been received in last sec
+	//            2.1 soft reboot (up to maxNumSoftRebootTries)
+	//            2.2 hard reboot if soft reboot tries exceeds maxNumSoftRebootTries
+	//------------------------------------------------------------------------------
   timeDeltaRx = millis()-timeStampMostRecentRx;
   Serial.print("Main Loop: timeDeltaRx = ");
   Serial.println(timeDeltaRx);  
@@ -709,7 +700,6 @@ void rebootResolveI2C(void)
   }    
 }
 
-
 void enQueue(uint8_t * data, int length){
   
     // Serial.print("EnQUE ");
@@ -734,7 +724,6 @@ void enQueue(uint8_t * data, int length){
       //    printQueue();
      // Serial.print(front);
 }
-
 
 void printQueue()
 {
@@ -781,7 +770,6 @@ void deQueuebuff(uint8_t * rxdata){
    }
 }
 
-
 void MeasureWetDryContactInputs()
 {
     int result=0;
@@ -805,7 +793,6 @@ void TxVersionInfo()
     Wire.write(txbuff, 4);
 }
 
-
 void MeasureZero2TenInputs()
 {
   int tempdata = 0;
@@ -827,7 +814,6 @@ void MeasureZero2TenInputs()
     zero2teninputstatus[7]=(uint8_t)(tempdata >> 8)&0xFF;
     zero2teninputstatus[8]=(uint8_t)(tempdata&0xFF);
 }
-
 
 void MeasurePWMCurrent()
 {
@@ -855,7 +841,6 @@ void MeasurePWMCurrent()
       pwmcurrentstatus[(2*i)+2]=char(data[i]&0xFF);
     }
 }
-
 
 void setOutputPolarity(uint8_t mode)
 {
@@ -897,8 +882,6 @@ void setOutputPolarity(uint8_t mode)
     }
 }
 
-
-
 void setZero2TenVoltDrive(uint8_t * drivebuff)
 {
 
@@ -933,6 +916,7 @@ void setZero2TenVoltDrive(uint8_t * drivebuff)
       analogWrite(ainDrive[i],driveValue); 
    }
 }
+
 void setPLCState(uint8_t stateval)
 {
   //  Serial.print("PLC data= ");
@@ -1018,5 +1002,4 @@ void printdebug(char* str, int flag)
     {
       Serial.print(str);
     }
-        
 }
