@@ -61,7 +61,7 @@
 // (7) started commenting/refactoring code for readability
 //-------------------------------------------------------------------------------------
 #define RELEASENUMBERMAJOR 0
-#define RELEASENUMBERMINOR 8
+#define RELEASENUMBERMINOR 9
 #define LV_HV 0 //LV=0, HV=1
 #include <arduino.h>
 #include <i2c_t3.h>
