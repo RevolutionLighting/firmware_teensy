@@ -1,28 +1,48 @@
 
 
-void updateHVSR(int dimmeredge, uint8_t dimmerrelaystate)
+void setHV_AC_SENS_SRC(uint8_t src)
 {
-    if (LV_HV==0)
-    {   
-        // LV Board
-        // One 8-bit shift register
-        // constructing serial stream being send to shift registers
-        //               (mask off bottom 4 bits
-        int outputWord = ((dimmeredge&0xF0)<<8)+((dimmerrelaystate&0xF0)<<4)+((dimmeredge&0x0F)<<4)+(dimmerrelaystate&0x0F);
-        // int outputWord = ((dimmerEdge&0x0F)<<12)+((dimmerRelayState&0x0F)<<8)+((dimmerEdge&0xF0))+((dimmerRelayState&0xF0)>>4);
-       // Serial.println("");
-       // Serial.print("Update HVSR with 16 bit value ");
-       // Serial.println(outputWord,HEX);
-        shiftRegisterWriteWord16(outputWord);
-    }
+    // src = 0 - 3 ,  
+    hv_ac_sens_src = src;
+  // Serial.print("ac source updated  ");
+  // Serial.println(hv_ac_sens_src);
+   last_hv_ac_sens_src_switch_mills = millis();
+    updateHVSR();
+
+    // delay(50);  
+}
+
+void updateHVSR()
+{
     if (LV_HV==1)
     {
-//        int outputWord = ((dimmerEdge&0xF0)<<8)+((dimmerRelayState&0xF0)<<4)+((dimmerEdge&0x0F)<<4)+(dimmerRelayState&0x0F);
-        int outputWord = (powerfailovermask<<16)+((dimmeredge&0xF0)<<8)+((dimmerrelaystate&0xF0)<<4)+((dimmeredge&0x0F)<<4)+((dimmerrelaystate&0x0F));
-       // Serial.println("");
-      //  Serial.print("Update HVSR with 24 bit value ");
-      //  Serial.println(outputWord,HEX);
-        shiftRegisterWriteWord24(outputWord);
+        int src_nib = 0;
+        if(hv_psource0)
+            src_nib |= 0x01;
+         if(hv_psource1)
+            src_nib |= 0x02;
+
+
+        
+         // test. 
+           
+        // make MSB out of remainder parts.
+        int shift = hv_ac_sens_src + 2;
+        uint8_t MSB = (0x01 << shift) | src_nib;  //active high way 
+
+       
+        //active low on ac sens I think, 
+       //  uint8_t sensmask = 0x0F;
+       //  sensmask &= ~(0x01 << hv_ac_sens_src); // clear bit,
+      //  uint8_t MSB = (sensmask << 2) | src_nib;  //active low way, 
+        
+        int outputWord = MSB << 8 | hv_dimmerrelaystate;
+       
+       // Serial.println("-----------------------------");
+      //  Serial.print("Update HVSR with 16 bit value: ");
+       // Serial.println(outputWord,HEX);
+       
+        shiftRegisterWriteWord16(outputWord);            // < --------------------- bring in when sr hw / relays are in place   ---------------- 
     }
 }
 
@@ -32,7 +52,7 @@ void updateHVSR(int dimmeredge, uint8_t dimmerrelaystate)
 byte shiftRegisterReadByte()
 {
  // Serial.println("shiftRegisterReadByte() called");
- updateHVSR(dimmerEdge, dimmerRelayState);
+// updateHVSR(dimmerEdge, dimmerRelayState);  //    NGP removed 9/7/16,  not sure why this is there... maybe to update state vars. ???, 
  
   byte i=0;
   byte val= 0x00;
