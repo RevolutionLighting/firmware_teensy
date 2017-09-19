@@ -2,10 +2,10 @@
 // Revolution Lighting Project Firmware
 //-------------------------------------------------------------------------------------
 // Version 1.0
-// Added HV phase support new way,  
+// Added HV phase support new way,
 // passes lv board test 9/14/17
 //
-// 
+//
 
 // Version 0.9
 // Changed ain freq from 10K to 200 hz becuase of shared timer  issue ftm0/1,2,3... between
@@ -68,7 +68,7 @@
 //-------------------------------------------------------------------------------------
 #define RELEASENUMBERMAJOR 1
 #define RELEASENUMBERMINOR 0
-#define LV_HV 0 //LV=0, HV=1
+#define LV_HV 1 //LV=0, HV=1
 #include <arduino.h>
 #include <i2c_t3.h>
 
@@ -92,8 +92,8 @@ void set0_10V(int dimmer, int mode);
 void updateHVSR();
 void hvDimMode (uint8_t data);
 void relayUpdate(void);
-void softReboot(void);
-void hardReboot(void);
+void softRebootRPI(void);
+void hardRebootRPI(void);
 void rebootResolveI2C(void);
 void enQueue(uint8_t * data, int length);
 void printQueue(void);
@@ -103,8 +103,8 @@ void TxVersionInfo(void);  // sends out version info, util func.
 // methods for measurements
 void MeasureWetDryContactInputs(void);
 void MeasureZero2TenInputs(void);
-void MeasurePWMCurrent(void);   // take pwm current measurment
-void MeasureRMSCurrent(int chNum);  //
+void MeasureLV_PWMCurrent(void);   // take pwm current measurment
+
 
 // routines for set hw
 void setOutputPolarity(uint8_t mode);
@@ -138,22 +138,13 @@ void setPWMState(uint8_t * pwmvals);
 // Globals for Teensy-to-Pi Rest Interface
 //-------------------------------------------------------------------------------------
 
-boolean EnableFailSafeReboot = false;                   // false disables failsafe soft/hard reboot code
-boolean ReceivedAnyI2cFromPi = false;                   // Set true 1st time Teensy receives data from Pi
-boolean bootTimeWaitDone = false;                       // Set true in mainloop after bootWaitTime exceeded
-unsigned long bootUpMillis;                             // timestamp when setup() ran
-unsigned long rebootWaitTimeMillis = 45000;             // 45 seconds
+const unsigned long REBOOT_WAITTIME_MS = 45000;             // 45 seconds time to wait(delay) if soft or hard reboot is issued
 unsigned long timeStampMostRecentRx;                    // loop(): Zero indicates no Rx event received yet
-unsigned long timeSinceMostRecentRx;                    // loop(): Zero indicates no Rx event received yet
-unsigned long timeDeltaRx = 0;                          // loop():
 
-int softRebootTryNum = 0;                               // iterator
+unsigned long timeLastRebootRequest = 0;                    // time of the last soft/hard reset request to pi.
+boolean waitingForRPIBoot = false;
+int softRebootTryNum = 0;                               // count of number of soft resets,
 int maxNumSoftRebootTries = 3;                          // max # soft reboot tries before hard rebooting
-
-// Used in received event handler only
-unsigned long nTimeStampMostRecentRx;                   // Used in rx event handler
-unsigned long nTimeDeltaRx = 0;                         // ""
-unsigned long nTimeStampPriorRx;                        // ""
 
 //-------------------------------------------------------------------------------------
 // Globals Pin Definitions
@@ -171,7 +162,7 @@ const int pwmPin_HVL[] = {2, 3, 4, 29, 6, 9, 10, 5};        // pwmPins swizzled 
 const int analogIn[] = {A22, A0, A1, A2};               //
 const int n_analogIn = 4;                               //
 
-const int plcOut[] = {27, 28, 11, 13};                 // PLC outputs 
+const int plcOut[] = {27, 28, 11, 13};                 // PLC outputs
 const int n_plcOut =  4;                               //
 
 const int ainDrive[] = {21, 22, 23, 30};                //
@@ -189,35 +180,7 @@ volatile uint8_t received;                              // ***
 uint16_t pwmData[] = {0x0000, 0x0000, 0x0000, 0x0000,   // ***
                       0x0000, 0x0000, 0x0000, 0x0000
                      };
-//-------------------------------------------------------------------------------------
-// *** RMS CURRENT Globals
-//-------------------------------------------------------------------------------------
-// configure current measurement details here:
-unsigned long samplesPerSec = 1000;                               //
-unsigned long windowLenSecs = 1;                                  // 1 second window len
-
-// Calculate sampling time period in mS => 1/samplesPerSec*1000
-// unsigned long iSamplePeriod = (1/samplesPerSec)*1000;          // **this is returning 0 for some reason**
-unsigned long iSamplePeriod = 1;                                  // so, do manual calculation instead
-
-// Allocate memory for iWindow array
-//const int len_iWindow = int(samplesPerSec*windowLenSecs);       // **This isn't casting to type int**
-//const int len_iWindow = (int)samplesPerSec*windowLenSecs;       // **same as above...**
-const int len_iWindow = 1000;                                     // so, do manual calculation instead
-long iWindow[ len_iWindow ];                                      //
-
-// temp variables
-long iWindowSum = 0;                    // for removing dc bias
-long iWindowAvg = 0;                    // for removing dc bias
-long iWindowPow2Sum = 0;                // for rms calc
-long iWindowPow2Mean = 0;               // for rms calc
-long iRMS = 0;                          // RMS current from window
-
-// sample timestamping
-unsigned long iTimeLastSample  = 0;     // time stamp of previous current meas.
-// data "returned" via this array
-long rmsCurrentArray[8] = {0, 0, 0, 0, 0, 0, 0, 0};   // this array store rms current
-
+                     
 //-------------------------------------------------------------------------------------
 // *** QUEUE Globals
 //-------------------------------------------------------------------------------------
@@ -256,36 +219,36 @@ byte resetpulse = 0x01;
 byte wdcontact_state_changed_mask = 0;  //flag when wd contact is read out from rpi
 
 
-// Phase Dimming for HV board .vars 
-long lastsr_d_in_value = 0;  // last value read in from the shift reg  data val.  , for calc zero cross time, 
-unsigned int sync_pulse_count = 0;  // the number of pulses read in 
+// Phase Dimming for HV board .vars
+long lastsr_d_in_value = 0;  // last value read in from the shift reg  data val.  , for calc zero cross time,
+unsigned int sync_pulse_count = 0;  // the number of pulses read in
 unsigned long accum_pulse_durations = 0;  // total pulse lengths (accumulation)... is divided to get avg,...over window
-//byte active_bank = 0; // 0 = (bank 1-4),  1 = bank 5-8 // this is the bank currently being measured. 
-unsigned long falling_edge_sync = 0;  // the last time we got a falling edge on sync, used to measure pulse widths. for zero cross measurments. 
+//byte active_bank = 0; // 0 = (bank 1-4),  1 = bank 5-8 // this is the bank currently being measured.
+unsigned long falling_edge_sync = 0;  // the last time we got a falling edge on sync, used to measure pulse widths. for zero cross measurments.
 
 unsigned int NUM_PULSES_TO_AVG = 32; //64;
 //PhaseDimmer* phaseDimmers = new PhaseDimmer[8];
 
-// new power failure/ shift reg stuff. 
+// new power failure/ shift reg stuff.
 //NICK NOTES: 9/7/17
-// HV shift reg changes for rev c, 
+// HV shift reg changes for rev c,
 // 16 bits total for write side:
-// bits 0 - 7 ,  0-10v mode 
+// bits 0 - 7 ,  0-10v mode
 // bit 8  psource 0  // power fail over,  X
 // bit 9 psource 1   // pfo ...X
 
-// bit 10 ac sens sel0  // for reading src 0 
+// bit 10 ac sens sel0  // for reading src 0
 // bit 11    sel 1
 // bit 12    sel 2
 // bit 13    sel 3
 uint8_t hv_dimmermode = 0; //  used for tracking mode set by user 0-10 or phase dim. 0 is phase  / 1 is 0-10
-uint8_t hv_dimmerrelaystate = 0;  //var used for holding dimmer relay state. open / closed (1) 
-boolean hv_psource0 = true;  //var used for holding state of power source (line/emergency ) for outs 1-4  // assume we have power --- true is Util,  false is aux. 
+uint8_t hv_dimmerrelaystate = 0;  //var used for holding dimmer relay state. open / closed (1)
+boolean hv_psource0 = true;  //var used for holding state of power source (line/emergency ) for outs 1-4  // assume we have power --- true is Util,  false is aux.
 boolean hv_psource1 = true;  //var used for holding state of power source (line/emergency ) for outs 5-8
-uint8_t hv_ac_sens_src = 1;  //var used for switching the ac source for reading zero cross/level.  one of 4 sources  (val = 0 - 3) 
-int dimmerEdge = 0x00;   // var holder, for holding phase direction (forward or reverse) for hv, ,  set by setting outputpolarity command from host,  (shared with LV output pol). 
+uint8_t hv_ac_sens_src = 1;  //var used for switching the ac source for reading zero cross/level.  one of 4 sources  (val = 0 - 3)
+int dimmerEdge = 0x00;   // var holder, for holding phase direction (forward or reverse) for hv, ,  set by setting outputpolarity command from host,  (shared with LV output pol).
 
-// vars used for holding the last valid time power was detected on given src number, (used for power failover logic). 
+// vars used for holding the last valid time power was detected on given src number, (used for power failover logic).
 // there are in mills
 unsigned long last_valid_power_src0 = 0;
 unsigned long last_valid_power_src1 = 0;
@@ -298,6 +261,35 @@ unsigned long last_hv_ac_sens_src_switch_mills = 0;
 // PWM Current measurment (LV) new non blocking way 9/14/17
 int pwmcurrentsamplecount = 0;   // number of samples taken per channel
 long pwm_sample_data[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+
+
+// temp code for testing resets 9/14/17
+long temp_softreset_countdown = 40000;
+
+
+float last_5_8_freq = 120.00;  //for debug.
+
+int current0_10_meas_index = 0;  // 0 -3  used for the 0-10 volt measuring ,  inc'd per X number of cycles,
+
+// for debug,  measuring cycle (loop) times. 
+long test_last_loop_us = 0;
+float maxcycletime = 0;
+float avgcycletime = 0.0;
+float mincycletime = 0xFFFFF;
+// ***************************************
+
+
+// NGP --- new hv current meas stuff 9/19/17
+long rms_sample_length = 1000000; //16600; // in US,  1 full cycle  60Hz
+long rms_sample_start_time = 0;
+
+uint8_t rms_channel_meas = 0;  // which channel are we measuing.
+unsigned long rmsAccumHolder = 0;  // holds current accum value.
+unsigned long lastsampletime = 0;   // time stamp of when last sampel was read in and added to accum
+unsigned long num_samples_taken = 0;  // number of samples taken ,(divistor to calc avg. )
+unsigned long sampleHolder[200];  // holds samples during measurment cycle. 
+unsigned long samplemin = 0xFFFF;  //debug only 
+unsigned long samplemax = 0;  //debug only 
 
 // -------------------------------------------------------------------------------------------
 
@@ -313,11 +305,16 @@ void setup()
   pinMode(SR_DAT, OUTPUT);          // I2C data
   pinMode(SR_DAT_IN, INPUT);          // I2C data
   pinMode(SR_LAT, OUTPUT);          // ShiftRegister clock
+
   pinMode(PI_RUN_RESET, OUTPUT);    // Hard reboot
+  digitalWrite(PI_RUN_RESET, LOW);
+
+
   pinMode(PI_GPIO18_PIN12, OUTPUT); // Soft reboot
+  digitalWrite(PI_GPIO18_PIN12, LOW);  // default to low
   //pinMode(vinSense,INPUT);
   int i;
-  // PWM outputs (LV 24 pwm,  on hv  its either 0-10 or phase) depending on mode. 
+  // PWM outputs (LV 24 pwm,  on hv  its either 0-10 or phase) depending on mode.
   for (i = 0; i < 8; i++)
   {
     if (LV_HV == 0)
@@ -328,45 +325,45 @@ void setup()
     }
     else
     {
-       pinMode(pwmPin_HVL[i], OUTPUT);
-       analogWrite(pwmPin_HVL[i] , 32767);
-       analogWriteFrequency(pwmPin_HVL[i], 119.97);  //PWM freq
+      pinMode(pwmPin_HVL[i], OUTPUT);
+      analogWrite(pwmPin_HVL[i] , 32767);
+      analogWriteFrequency(pwmPin_HVL[i], 119.97);  //PWM freq
     }
   }
 
-  // PLC outputs 
-   for (i = 0; i < 4; i++) // length of total array / length of element (byte) = # elements
+  // PLC outputs
+  for (i = 0; i < 4; i++) // length of total array / length of element (byte) = # elements
   {
-      pinMode(plcOut[i], OUTPUT);
-      digitalWrite(plcOut[i], LOW);
+    pinMode(plcOut[i], OUTPUT);
+    digitalWrite(plcOut[i], LOW);
   }
 
-  // Dry Contacts 
+  // Dry Contacts
   pinMode(dc[0], INPUT);
   pinMode(dc[1], INPUT);
   pinMode(dc[2], INPUT);
   pinMode(dc[3], INPUT);
 
 
- // pwm current measurment pins
+  // pwm current measurment pins
   for (i = 0; i < (sizeof(iMeas) / 4); i++)
   {
     pinMode(iMeas[i], INPUT);
   }
 
-  // 0-10 volt current drive(active devices) --- this is not enabled offically becuase of ftm criss - cross. 
+  // 0-10 volt current drive(active devices) --- this is not enabled offically becuase of ftm criss - cross.
   for (i = 0; i < (sizeof(ainDrive) / 4); i++)
   {
     pinMode(ainDrive[i], OUTPUT);
-  //  analogWriteFrequency(ainDrive[i], PWM_FREQ); //  8/22 changed from 10K, to 200 Hz, to fix pwm channels. 10000);     // 10kHz PWM freq
+    //  analogWriteFrequency(ainDrive[i], PWM_FREQ); //  8/22 changed from 10K, to 200 Hz, to fix pwm channels. 10000);     // 10kHz PWM freq
   }
 
   // 0-10 volt inputs
-  for (i = 0; i < (sizeof(analogIn) / 4); i++)        
+  for (i = 0; i < (sizeof(analogIn) / 4); i++)
   {
     pinMode(analogIn[i], INPUT);
   }
-  
+
   analogWriteResolution(16);
   analogReadResolution(12);
   analogReadAveraging(256);
@@ -378,11 +375,6 @@ void setup()
   Serial.println("Teensy Setup has run! We've Booted!");
 
   //delay must take place before interupt handlers are enabled
-  //interupt handler ignore delay statementswait 45 seconds
-  bootUpMillis = millis();
-  //Serial.println("Waiting 45 seconds");
-  //delay(rebootWaitTimeMillis);
-  //Serial.println("45 seconds since Teensy booted");
   delay(1000);
 
   // Register wire/I2c slave received and request handlers
@@ -396,11 +388,7 @@ void setup()
   // Write shiftreg
   shiftRegisterWriteWord16(0x0001);
 
-  // Test Feather / Soft Reboot
-  //softReboot();
 
-  // Test Hammer / Hard Reboot
-  //hardReboot();
 
   // Print RMS current measurement settings:
   //     printdebug("Testing Print Debug\n", DebugRMSCurrent);
@@ -430,23 +418,88 @@ void setup()
   last_valid_power_src3 = millis();
   setHV_AC_SENS_SRC(1);
 
-  
+  // ngp 9/14/17, assume we have rx atleats one packet...for rpi reboot logic.
+  timeStampMostRecentRx = 0; //millis()-10000;
+
+  // used for measuing loop time,  can be removed eventually.
+  test_last_loop_us = micros();
+
+  // setup the zero cross isr
+  if (LV_HV == 1)
+  {
+    attachInterrupt(digitalPinToInterrupt(SR_DAT_IN), ZeroCrossISR, FALLING);
+    setNextACSensSrc();
+  }
+
+
 }	// End setup()
 
+volatile long zc_isr_count = 0;
+volatile long isr_start_meas = micros();
+volatile float lastisr_meas = 0.0;
+
+//****************************************************************************************************
+// ********************************************* Zero Cross ISR **************************************
+
+//****************************************************************************************************
+void ZeroCrossISR() {
+
+
+  int PULSE_CNT_LIMIT = 8;
+  if (hv_ac_sens_src == 0 || hv_ac_sens_src == 2)
+    PULSE_CNT_LIMIT = 4;// do 6 pulses just for aux inputs,  to save time,
+
+
+  if (zc_isr_count >= 0)
+  {
+    if (zc_isr_count == 0)
+      isr_start_meas = micros();
+
+    zc_isr_count++;
+
+    if (zc_isr_count >= PULSE_CNT_LIMIT)
+    {
+      long delta = micros() - isr_start_meas;
+      lastisr_meas = (float)delta / (float)(zc_isr_count - 1);
+
+      float avg_freq = (float)1000000 / (float)lastisr_meas;
+      float basefreq = 2.00 * avg_freq;
+
+      // isr_start_meas = micros();
+
+      if (avg_freq > 58 && avg_freq < 62)
+      {
+        if (hv_ac_sens_src == 0 || hv_ac_sens_src == 3)
+          setPWMBaseFrequency(basefreq, hv_ac_sens_src);  // <--------------note only update if in valid range.
+        // update presense times
+        switch (hv_ac_sens_src)
+        {
+          case 0:
+            last_valid_power_src0 = millis();
+            break;
+          case 1:
+            last_valid_power_src1 = millis();
+            break;
+          case 2:
+            last_valid_power_src2 = millis();
+            break;
+          case 3:
+            last_valid_power_src3 = millis();
+            break;
+          default:
+            break;
+        }
+      }
+      zc_isr_count = -1;  // set it to wait state
+    }
+  }
+
+}
 void loop()
 {
   //-------------------------------------------------------------------------------------
   // Main Loop
   //-------------------------------------------------------------------------------------
-  // EnableFailSafeReboot: true to enable failsafe reboot code, false to disable
-  // timeStampMostRecentRx = Stamped by rx event hander when an rx event occurs
-  // timeDeltaRx = time since last rx
-  // rebootWaitTimeMillis: # of ms to wait for RPi to reboot
-  // maxNumSoftRebootTries: hard reset when this # of softReboot tries exceeded
-  // softRebootTryNum: iterator
-  // softReboot(void)
-  // hardReboot(void)
-  // rebootResolveI2C(void): failsafe reboot mode
   //-------------------------------------------------------------------------------------
   uint8_t rxdata[200];      // used for pulling in latest from queue.
   memset(rxdata, 0, sizeof(rxdata));  // /4
@@ -496,235 +549,251 @@ void loop()
   // measurement routines
 
   if (LV_HV == 0)
-  {
-   // Serial.println("  pwm current meas start");
-    MeasurePWMCurrent();
-   // Serial.println(" pwm current meas stop");
+  {   
+    MeasureLV_PWMCurrent();
   }
 
 
-   // ********************************************************************************************************
-   // ****************************************************************** PHASE DIM FOR HV ********************
-   // ********************************************************************************************************
+  // ********************************************************************************************************
+  // ****************************************************************** HV********************
+  // ********************************************************************************************************
   if (LV_HV == 1)
   {
-   
-   // this is proto for pwm way
-    // simple check for zero cross, and after X sec, (last sync,  reset the timer(ftm3) to 0,  to sync it, to zero cross. 
-    
+
+    // this is proto for pwm way
+    // simple check for zero cross, and after X sec, (last sync,  reset the timer(ftm3) to 0,  to sync it, to zero cross.
+
     unsigned long current_timemicros = micros();
-    unsigned long current_timemillis= millis();
-    // read sr data in,  (will be shift reg read )
-    long bitVal = digitalReadFast(SR_DAT_IN);
+    unsigned long current_timemillis = millis();
 
-     if(current_timemillis - last_hv_ac_sens_src_switch_mills >= 50)  // 50ms delay between switchs. 
-     {
-         // todo once shift regs are in. 
-        if (lastsr_d_in_value == 0 && bitVal == 1) //rising edge(forward edge)
-        {
-          lastsr_d_in_value = 1;  // just set state change,  do nothing else. 
-         //  Serial.println(" low to high");
-        }
-        else if (lastsr_d_in_value == 1 && bitVal == 0) // falling edge  (reverse) 
-        {
-          lastsr_d_in_value = 0;
-          if(falling_edge_sync == 0)
-          {
-             falling_edge_sync = current_timemicros;  // update edge time only
-          }
-          else
-          {
-            unsigned long zero_cross_pulse_duration_reverse = current_timemicros - falling_edge_sync;  // calc zero cross pulse duration, (should be around 16660+ us, ) 
-            falling_edge_sync = current_timemicros;  // update edge time
-            accum_pulse_durations += zero_cross_pulse_duration_reverse;
-            sync_pulse_count++;
-          }
+    if (zc_isr_count == -1) // switch source
+    {
+      setNextACSensSrc();
 
-          int pulsecnt_threshold = 8;
-          if(hv_ac_sens_src == 0 || hv_ac_sens_src == 2)
-          {
-              pulsecnt_threshold = 4;
-          }
-          
-          if(sync_pulse_count >= pulsecnt_threshold)  // *********************** TIME TO Take measurment,, , ***********************
-          {
-            // Serial.println(accum_pulse_durations);
-             falling_edge_sync = 0; //reset of vars. 
-             sync_pulse_count = 0;
-            unsigned long avg_dur_us = accum_pulse_durations/pulsecnt_threshold; 
-            accum_pulse_durations = 0; 
-            float avg_freq = (float)1000000/(float)avg_dur_us;
-            float basefreq = 2.00*avg_freq;
-           // Serial.print(getAC_SensSrcName(hv_ac_sens_src)); 
-           
-            if(avg_freq > 58 && avg_freq < 62)
-            {
-                //  Serial.print(" (VALID) = "); 
-                //  Serial.print(hv_ac_sens_src);
-                 // Serial.print("  :  " );
-                //  Serial.println(avg_freq);
-                 if(hv_ac_sens_src == 1 || hv_ac_sens_src == 3)  //only sync on util lines.  not aux. 
-                 {                 
-                    //basefreq = 120.06;
-                    //Serial.print("Updated pwm for src " );
-                    // Serial.print(hv_ac_sens_src);
-                    // Serial.print("  :  " );
-                   // Serial.println(basefreq);
-                    setPWMBaseFrequency(basefreq,hv_ac_sens_src);  // NOTE:   this need to be enabled ,,,, based on wire change becuase of banking of pwms...and (REWIRE)....
-                 }
-                   
-                 switch(hv_ac_sens_src)
-                 {
-                     case 0:
-                        last_valid_power_src0 = current_timemillis;
-                      break;
-                     case 1:
-                         last_valid_power_src1 = current_timemillis;
-                       break;
-                       case 2:
-                          last_valid_power_src2 = current_timemillis;
-                       break;
-                       case 3:
-                       last_valid_power_src3 = current_timemillis;
-                       break;
-                       default:
-                       break;
-                 } 
-            }
-            else
-            {
-                // Serial.print(" (INVALID VALUE (Ignored) = "); 
-                // Serial.println(avg_freq);
-            }
-    
-            //switch bank we are looking at. 
-           setNextACSensSrc();
-           
-          }
-          // digitalWrite(pwmPin[0], LOW);  //for debug
-         // Serial.println("high to low");
-        }
-        else if(current_timemillis - last_hv_ac_sens_src_switch_mills > 1000)
-        {
-            falling_edge_sync = 0; //reset of vars. 
-            sync_pulse_count = 0;
-            accum_pulse_durations = 0; 
-           // Serial.print(getAC_SensSrcName(hv_ac_sens_src)); 
-           // Serial.println(" (TIMEOUT: !) = assumed 0 "); 
-           setNextACSensSrc();
-        }
+      zc_isr_count = -2;
+      // zc_isr_count = 0;
+    }
+    else if (zc_isr_count == -2)
+    {
+      if (current_timemillis - last_hv_ac_sens_src_switch_mills >= 3)
+      {
+        zc_isr_count = 0;  // go back to in meas.
+      }
+
+    }
+
+    // if last time has been more than 1000 ms,  then timeout.  and auto switch(in caes pwr src is not present.
+    if (current_timemillis - last_hv_ac_sens_src_switch_mills > 1000)
+    {
+      zc_isr_count = -2;
+      //  Serial.print(getAC_SensSrcName(hv_ac_sens_src));
+      //  Serial.println(" (TIMEOUT: !) = assumed 0 ");
+      setNextACSensSrc();
+    }
 
 
-     }
-
-   
-    
     PowerFailOverTestAndHandle();
-  }  // end if HV 
 
-  
 
-  // ********************************************************************************************************
-  // ********************************************************************************************************
-  // *********************************** END phase mode dev ******************************
-  // ********************************************************************************************************
 
-  //else
-  //{
-  // RMS Current Sampling
-  // Note: iTimeLastSample intitialized to 0 in setup()
-  //if ( (millis() - iTimeLastSample) >= iSamplePeriod ) // time to measure next sample?
-  //{
-  //  for (int chNum = 0; chNum < 8; chNum++)
-  //  {
-  // MeasureRMSCurrent(0);    // put scalar rms current value in: rmsCurrentArray[chNum]
-  // }
-  //}
-  //}
+
+    //*********************************************************************************
+    // HV RMS Current Sampling
+    // approx calc is 9 counts per mA... as of 9/19/17
+    MeasureHV_RMSCurrent();
+    // *********************************************** END RMS ***********************
+
+  }  // end if HV
+ 
+
+  // ******************************************************************************************
+  // RESET OF RPI LOGIC  /soft/hard
+  // reboot is triggerd by loss of i2c traffic...
+  //*********************************************************************************************
+  /*   long delta = millis() - timeLastRebootRequest;
+     if((delta) > REBOOT_WAITTIME_MS)  // dont check until 45 sec after the last reboot request
+     {
+        if(waitingForRPIBoot)
+        {
+           Serial.println("i2c Check started");
+           waitingForRPIBoot = false;
+        }
+        rebootResolveI2C();  // <---------------------------------------------disable this line to remove this check
+     }
+     else
+     {
+         if(!waitingForRPIBoot)
+         {
+            waitingForRPIBoot = true;
+            Serial.println("waiting for rpi boot");
+         }
+     }
+  */
+  // *****************************end reset / reboot logic of rpi  ***************
+
+
   //Serial.println(micros());
-  
+
+  // as of 9/14/17,  loop time on LV is 200uS
+
   loopcount++;                 //10000 == 25ms,
-  if (loopcount >= 1000)     // 40000 == 100ms,
+  if (loopcount >= 100000)     // 40000 == 100ms,
   {
     // Serial.println(micros());
-    loopcount = 0; 
+    loopcount = 0;
     MeasureZero2TenInputs();  // this is non blocking. ...
-    MeasureWetDryContactInputs();  // this is non  blocking, 
-    //Serial.println("loop rollover");
+    // NOTE ,  100000 is the slowest time allowed ,  for now,  other wise you will miss the clicks.
+    MeasureWetDryContactInputs();  // this is non  blocking, but must be dont fast enough to pick up clicks.
+
+
+    //long temp_val = analogRead(iMeas[0]);
+    //  Serial.println(temp_val);
+    /*
+        Serial.print("looptime max: " );
+        Serial.print(maxcycletime);
+
+        Serial.print(" min: " );
+        Serial.print(mincycletime);
+
+        float avg = avgcycletime / (float)100000;
+
+        Serial.print(" avg: " );
+        Serial.println(avg);
+
+        avgcycletime = 0;
+        maxcycletime = 0;
+        mincycletime = 10000.0;
+    */
+    // Serial.print("ZC_ISR MEAS TIME HZ: ");
+
+    // float avg_freq = (float)1000000 / (float)lastisr_meas;
+    // float basefreq = 2.00 * avg_freq;
+
+    // Serial.print(hv_ac_sens_src);
+    // Serial.print("   ");
+    // Serial.println (avg_freq);
+
   }
-  
+
+
+
+  long markmicros = micros();
+  float deltatime = (float)(markmicros - test_last_loop_us);
+  if (deltatime > maxcycletime)
+  {
+    maxcycletime = deltatime;
+  }
+
+  if (deltatime < mincycletime)
+  {
+    mincycletime = deltatime;
+  }
+
+  test_last_loop_us = markmicros;
+
+
+  avgcycletime += deltatime;
+
+
+  // test code for reset countdown....loop, till reset.
+
+  /*if(temp_softreset_countdown > 0)
+    {
+     temp_softreset_countdown--;
+     if(temp_softreset_countdown == 0)
+     {
+       //softRebootRPI();
+       hardRebootRPI();
+     }
+    }
+  */
+  // end countdown test ***************************
+
+
+
 } // end main loop()
 
 void setNextACSensSrc()
 {
-   uint8_t nextsrc = 1;  //swizzle,  0 , 2, 1, 3,, ..0 
-   
-  /*  if(hv_ac_sens_src == 1)
-    {
-        nextsrc = 3;
-    }
-    else
-        nextsrc = 1;
-     */   
-     
-     
-      
-      switch (hv_ac_sens_src)
-      {
-        case 0:
-           nextsrc = 2;
-           break;
-        case 1:
-            nextsrc = 3;
-           break;
-        case 2:
-           nextsrc = 1;
-           break;
-        case 3:
-           nextsrc = 0;
-           break;
-         default:
-         break;
-      }  
-      setHV_AC_SENS_SRC(nextsrc);
+  uint8_t nextsrc = 1;  //swizzle,  0 , 2, 1, 3,, ..0
+
+  // if(hv_ac_sens_src == 1)
+  // {
+  //nextsrc = 3;
+  // }
+  //  else
+  //   nextsrc = 1;
+
+  switch (hv_ac_sens_src)
+  {
+    case 0:
+      nextsrc = 2;
+      break;
+    case 1:
+      nextsrc = 3;
+      break;
+    case 2:
+      nextsrc = 1;
+      break;
+    case 3:
+      nextsrc = 0;
+      break;
+    default:
+      break;
+  }
+
+  setHV_AC_SENS_SRC(nextsrc);
 }
 
 char* getAC_SensSrcName(uint8_t srcnum)
 {
-    switch(srcnum)
-    {
-      case 0:
+  switch (srcnum)
+  {
+    case 0:
       return "AUX  (1-4)";
-      case 1:
+    case 1:
       return "LINE (1-4)";
-      case 2:
+    case 2:
       return "AUX  (5-8)";
-      case 3:
+    case 3:
       return "LINE (5-8)";
-      default:
+    default:
       return "UNKNOWN";
-    }
+  }
 }
 
 void setPWMBaseFrequency(float freq, int bank) // boolean forward)
 {
-  if(bank == 0 || bank == 1)
+  if (bank == 0 || bank == 1)
   {
-     // Serial.print("bank 0/1 freq: ");
-     //  Serial.println(freq);
-     analogWriteFrequency(pwmPin_HVL[0], freq);  // these are on ftm 1,2,3
-     analogWriteFrequency(pwmPin_HVL[1], freq);   
-     analogWriteFrequency(pwmPin_HVL[2], freq);   
-     analogWriteFrequency(pwmPin_HVL[3], freq);   
+    // Serial.print("bank 0/1 freq: ");
+    // Serial.println(freq);
+    analogWriteFrequency(pwmPin_HVL[0], freq);  // these are on ftm 1,2,3
+    analogWriteFrequency(pwmPin_HVL[1], freq);
+    analogWriteFrequency(pwmPin_HVL[2], freq);
+    analogWriteFrequency(pwmPin_HVL[3], freq);
   }
   else if (bank == 2 || bank == 3)              // NOTE ,  these are all on FTM 0
   {
-    //  Serial.print("bank 2/3 freq: ");
-    //   Serial.println(freq);
-     analogWriteFrequency(pwmPin_HVL[4], freq);  
-  //   analogWriteFrequency(pwmPin_HVL[5], freq);   
-   //  analogWriteFrequency(pwmPin_HVL[6], freq);   
-   //  analogWriteFrequency(pwmPin_HVL[7], freq);   
+    //Serial.print("bank 2/3 freq: ");
+    // Serial.println(freq);
+    analogWriteFrequency(pwmPin_HVL[4], freq);
+
+
+    //   if(delta > 0.10)
+    // {
+    //    Serial.print("**************big delta detected:  ");
+    //     Serial.println(delta);
+    // digitalWrite(plcOut[0], HIGH);
+    //  delay(100);
+    // digitalWrite(plcOut[0], LOW);
+
+    // }
+
+    // these are not needed becuase they are on the same ftm...
+    //   analogWriteFrequency(pwmPin_HVL[5], freq);
+    //  analogWriteFrequency(pwmPin_HVL[6], freq);
+    //  analogWriteFrequency(pwmPin_HVL[7], freq);
   }
 }
 
@@ -735,22 +804,22 @@ void setPWMState(uint8_t * pwmvals)
 
   for (int i = 0; i < 8; i++)
   {
-    int pwmValue = pwmvals[(2 * i) + 1] * 256 + pwmvals[(2 * i) + 2];  // extract value from array that is sent over. from host. 
-    int pct = (pwmValue * 100) / 65535;  // convert it to a pct value. 
+    int pwmValue = pwmvals[(2 * i) + 1] * 256 + pwmvals[(2 * i) + 2];  // extract value from array that is sent over. from host.
+    int pct = (pwmValue * 100) / 65535;  // convert it to a pct value.
 
-    int dutyValueReverse=int(float(pct*0.01)*65535);    // rising edge. (forward)
-    int dutyValueForward=int((1-float(pct*0.01))*65535);  // falling edge, (reverse) 
+    int dutyValueReverse = int(float(pct * 0.01) * 65535); // rising edge. (forward)
+    int dutyValueForward = int((1 - float(pct * 0.01)) * 65535); // falling edge, (reverse)
 
     //Serial.print(dutyValueForward);
     //Serial.print(" | ");
     //Serial.print(dutyValueReverse);
     //Serial.print(" | ");
-   // Serial.print(pwmValue);
+    // Serial.print(pwmValue);
     //Serial.print(" | ");
     Serial.print(pct);
     Serial.print(" | ");
 
-  
+
     if (LV_HV == 0)   // 8/23/17,   only for lv now.
     {
       analogWrite(pwmPin[i], pwmValue);
@@ -758,27 +827,30 @@ void setPWMState(uint8_t * pwmvals)
     }
     else  // HV
     {
-        int val = pwmValue; 
-        if(((dimmerEdge >> i) & 0x01) > 0)  // if forward
-        {
-           analogWrite(pwmPin_HVL[i],dutyValueForward);
-           pwmData[i] = dutyValueForward;
-           
-        }
-        else
-        {
-            analogWrite(pwmPin_HVL[i],dutyValueReverse);
-            pwmData[i] = dutyValueReverse;
-        }
-        // note need to add hvdimm mode check here too, to make sure not 0 -10 volt.    
-        
+      int val = pwmValue;
+      if (((dimmerEdge >> i) & 0x01) > 0) // if forward
+      {
+        analogWrite(pwmPin_HVL[i], dutyValueForward);
+        pwmData[i] = dutyValueForward;
+
+      }
+      else  // if reverse
+      {
+        if (dutyValueReverse == 0)
+          dutyValueReverse = 1;
+
+        analogWrite(pwmPin_HVL[i], dutyValueReverse);
+        pwmData[i] = dutyValueReverse;
+      }
+      // note need to add hvdimm mode check here too, to make sure not 0 -10 volt.
+
     }
   }
   Serial.println("");
 
   if (LV_HV == 1)
   {
-   // Serial.println("this is hv ,  no pwm adjust, using new alg" );
+    // Serial.println("this is hv ,  no pwm adjust, using new alg" );
     relayUpdate();
   }
 
@@ -794,6 +866,7 @@ void receiveEvent(size_t count)
 {
   uint8_t rxBuff[50];
 
+  timeStampMostRecentRx = millis();
   for (int i = 0; i < count; i++)
   {
     rxBuff[i] = Wire.readByte(); // copy data to mem
@@ -819,6 +892,7 @@ void receiveEvent(size_t count)
 // *****************************************************************************************************************************
 void requestEvent(void)
 {
+  timeStampMostRecentRx = millis();
   // ------------------------------------------
   // Node GET Command received:
   // Teensy Tx Event (I2C data -> PI)
@@ -865,14 +939,14 @@ void requestEvent(void)
 void setdimmerRelayState(int relaynumber, bool state)  // reminder ..state 1 (phase)  /0 = 0 -10 volt.
 {
   if (state)  // **************************************************************   NGP 9/8/17 inverted per ward at 2pm ,
-  {                
-   
+  {
+
     hv_dimmerrelaystate |= (0x01 << (relaynumber - 1)); // set bit,
   }
   else
   {
     hv_dimmerrelaystate &= ~(0x01 << (relaynumber - 1)); // clear bit,
-    
+
   }
   Serial.print("hv_dimmerRelayState: ");
   Serial.println(hv_dimmerrelaystate, HEX);
@@ -919,7 +993,7 @@ void relayUpdate(void)
     {
       if ((hv_dimmerrelaystate & mask) == 0) //The relay was previously closed, we need to open it
       {
-        setdimmerRelayState(i + 1, true);   // set to phase dim mode. 
+        setdimmerRelayState(i + 1, true);   // set to phase dim mode.
         delay(100);
       }
     }
@@ -934,7 +1008,7 @@ void relayUpdate(void)
     mask <<= 1;
 
 
-   
+
   }
 
   printAllOutputConfigInfo();
@@ -1040,37 +1114,60 @@ void TxVersionInfo()
 void MeasureZero2TenInputs()
 {
   int tempdata = 0;
-  memset(zero2teninputstatus, 0, sizeof(zero2teninputstatus));
-  zero2teninputstatus[0] = 8;
+  //memset(zero2teninputstatus, 0, sizeof(zero2teninputstatus));
+  //zero2teninputstatus[0] = 8;
 
-  tempdata = analogRead(analogIn[0]);
-  zero2teninputstatus[1] = (uint8_t)(tempdata >> 8) & 0xFF;
-  zero2teninputstatus[2] = (uint8_t)(tempdata & 0xFF);
+  switch (current0_10_meas_index)
+  {
+    case 0:
+      tempdata = analogRead(analogIn[0]);
+      zero2teninputstatus[1] = (uint8_t)(tempdata >> 8) & 0xFF;
+      zero2teninputstatus[2] = (uint8_t)(tempdata & 0xFF);
+      break;
+    case 1:
+      tempdata = analogRead(analogIn[1]);
+      zero2teninputstatus[3] = (uint8_t)(tempdata >> 8) & 0xFF;
+      zero2teninputstatus[4] = (uint8_t)tempdata & 0xFF;
+      break;
+    case 2:
+      tempdata = analogRead(analogIn[2]);
+      zero2teninputstatus[5] = (uint8_t)(tempdata >> 8) & 0xFF;
+      zero2teninputstatus[6] = (uint8_t)(tempdata & 0xFF);
+      break;
+    case 3:
 
-  tempdata = analogRead(analogIn[1]);
-  zero2teninputstatus[3] = (uint8_t)(tempdata >> 8) & 0xFF;
-  zero2teninputstatus[4] = (uint8_t)tempdata & 0xFF;
-  tempdata = analogRead(analogIn[2]);
-  zero2teninputstatus[5] = (uint8_t)(tempdata >> 8) & 0xFF;
-  zero2teninputstatus[6] = (uint8_t)(tempdata & 0xFF);
+      tempdata = analogRead(analogIn[3]);
+      zero2teninputstatus[7] = (uint8_t)(tempdata >> 8) & 0xFF;
+      zero2teninputstatus[8] = (uint8_t)(tempdata & 0xFF);
+      break;
+    default:
+      break;
+  }
 
-  tempdata = analogRead(analogIn[3]);
-  zero2teninputstatus[7] = (uint8_t)(tempdata >> 8) & 0xFF;
-  zero2teninputstatus[8] = (uint8_t)(tempdata & 0xFF);
+
+  current0_10_meas_index++;
+  if (current0_10_meas_index > 3)
+  {
+    current0_10_meas_index = 0;
+  }
+
+
+
+
 }
 
 
 
-void MeasurePWMCurrent()
+void MeasureLV_PWMCurrent()
 {
 
-    for (int i = 0; i < 8; i++)
-    {
-      pwm_sample_data[i] += analogRead(iMeas[i]);
-    }
-    pwmcurrentsamplecount++; //for div
-    
-  if(pwmcurrentsamplecount > 2000)
+  for (int i = 0; i < 8; i++)
+  {
+    pwm_sample_data[i] += analogRead(iMeas[i]);
+  }
+  pwmcurrentsamplecount++; //for div
+
+  if (pwmcurrentsamplecount > 2000)
   {
     //  Serial.println("PWM measurment done");
     memset(pwmcurrentstatus, 0, sizeof(pwmcurrentstatus));
@@ -1082,9 +1179,9 @@ void MeasurePWMCurrent()
       pwmcurrentstatus[(2 * i) + 2] = char(pwm_sample_data[i] & 0xFF);
     }
 
-     pwmcurrentsamplecount = 0;
-     memset(pwm_sample_data, 0, sizeof(pwm_sample_data));
-    
+    pwmcurrentsamplecount = 0;
+    memset(pwm_sample_data, 0, sizeof(pwm_sample_data));
+
   }
 }
 
@@ -1116,63 +1213,63 @@ void setOutputPolarity(uint8_t mode)
     int i;
 
     //
-   // if (oldDimmerEdge != newDimmerEdge)  // removed 
-   // {
-      // figure out which channels have changed phase direction,
-      //we need to toggle the dimmer relay on that channel, (phase --> 0 -10 ..or vice versa..),  to update it,
-      for (i = 0; i < 8; i++)
+    // if (oldDimmerEdge != newDimmerEdge)  // removed
+    // {
+    // figure out which channels have changed phase direction,
+    //we need to toggle the dimmer relay on that channel, (phase --> 0 -10 ..or vice versa..),  to update it,
+    for (i = 0; i < 8; i++)
+    {
+      if ((newDimmerEdge & 0x00000001) != (oldDimmerEdge & 0x00000001))
       {
-        if ((newDimmerEdge & 0x00000001) != (oldDimmerEdge & 0x00000001))
-        {
-          Serial.print("Dimmer Edge Direction ");
-          Serial.print(i);
-          Serial.println(" changed!");
-          resetToggleRelayToPhase(i + 1);
-        }
-        newDimmerEdge >>= 1;
-        oldDimmerEdge >>= 1;
+        Serial.print("Dimmer Edge Direction ");
+        Serial.print(i);
+        Serial.println(" changed!");
+        resetToggleRelayToPhase(i + 1);
+      }
+      newDimmerEdge >>= 1;
+      oldDimmerEdge >>= 1;
 
 
-         // 9/7/17  for new 
-         int edgeconfig = 0x002C;  //default is reverse. 
-         if((dimmerEdge >> i) & 0x01)  
-         {
-            edgeconfig = 0x0028;   // forward. 
-         }
+      // 9/7/17  for new
+      int edgeconfig = 0x002C;  //default is reverse.
+      if ((dimmerEdge >> i) & 0x01)
+      {
+        edgeconfig = 0x0028;   // forward.
+      }
 
-               // NEW PORT MAP...   = {2, 3, 4, 29, 6, 9, 10, 5};
-           switch(i)
-           {
-              case 0:       //pwm0 pin2, ftm3, ftmch 0
-                 FTM3_C0SC = edgeconfig;
-                 // Serial.print("FTM Reg updated to: ");
-                 // Serial.println(edgeconfig, HEX);
-                 break;
-               case 1:    //pwm1 pin3, ftm1, ftmch 0
-                 FTM1_C0SC = edgeconfig;
-                 break;
-              case 2:    //pwm2 pin4, ftm1, ftmch 1
-                 FTM1_C1SC = edgeconfig;
-                 break;
-              case 3:   // pwm3 pin29, ftm2, ftmch 0
-                 FTM2_C0SC = edgeconfig;
-                 break;
-                 // **********************************************
-              case 4:  // pwm4 pin6, ftm0, ftmch 4
-                FTM0_C4SC = edgeconfig;
-                 break;
-              case 5:  // pwm5 pin9, ftm0, ftmch 2
-                FTM0_C2SC = edgeconfig; 
-                 break;
-              case 6:  // pwm6 pin10, ftm0, ftmch 3
-                FTM0_C3SC = edgeconfig;  
-                 break;
-              case 7:  // pwm7 pin5, ftm0, ftmch 7
-                FTM0_C7SC = edgeconfig; 
-                 break;
-                 default:
-                 break;
-           }
+      // NEW PORT MAP...   = {2, 3, 4, 29, 6, 9, 10, 5};
+      switch (i)
+      {
+        case 0:       //pwm0 pin2, ftm3, ftmch 0
+          FTM3_C0SC = edgeconfig;
+          // Serial.print("FTM Reg updated to: ");
+          // Serial.println(edgeconfig, HEX);
+          break;
+        case 1:    //pwm1 pin3, ftm1, ftmch 0
+          FTM1_C0SC = edgeconfig;
+          break;
+        case 2:    //pwm2 pin4, ftm1, ftmch 1
+          FTM1_C1SC = edgeconfig;
+          break;
+        case 3:   // pwm3 pin29, ftm2, ftmch 0
+          FTM2_C0SC = edgeconfig;
+          break;
+        // **********************************************
+        case 4:  // pwm4 pin6, ftm0, ftmch 4
+          FTM0_C4SC = edgeconfig;
+          break;
+        case 5:  // pwm5 pin9, ftm0, ftmch 2
+          FTM0_C2SC = edgeconfig;
+          break;
+        case 6:  // pwm6 pin10, ftm0, ftmch 3
+          FTM0_C3SC = edgeconfig;
+          break;
+        case 7:  // pwm7 pin5, ftm0, ftmch 7
+          FTM0_C7SC = edgeconfig;
+          break;
+        default:
+          break;
+      }
     }
     printAllOutputConfigInfo();
   }
@@ -1226,108 +1323,6 @@ void setPLCState(uint8_t stateval)
   }
 }
 
-
-void MeasureRMSCurrent(int channelNum)
-{
-  iWindowSum = 0;
-  iWindowAvg = 0;
-  iWindowPow2Sum = 0;
-  iWindowPow2Mean = 0;
-  long minval = 5000;
-  long maxval = 0;
-
-  memset(iWindow, 0, sizeof(iWindow) / sizeof(iWindow[0])); // not necessary but probably a good idea for debugging
-
-  if (channelNum > 7) // valid channels are 0-7
-  {
-    Serial.print("Warning! Trying to measure current for invalid channel #: ");
-    Serial.println(channelNum);
-  }
-
-  // Shift all data in the array left discard oldest data pt
-  for ( int i = 0; i < len_iWindow - 1; i++ )
-  {
-    iWindow[i] = iWindow[i + 1];
-    iWindowSum += iWindow[i];
-
-    if ( iWindow[i] > maxval)
-      maxval = iWindow[i];
-
-    if ( iWindow[i] < minval)
-      minval = iWindow[i];
-  }
-  // Meas new data pt, append to array
-  iWindow[ len_iWindow - 1 ] = analogRead(iMeas[channelNum]);  // new meas data to last element in array
-  iWindowSum += iWindow[ len_iWindow - 1 ];
-  iWindowAvg = iWindowSum / len_iWindow;
-
-  // Remove DC component and calculate square
-  for ( int i = 0; i < len_iWindow; i++ )
-  {
-    iWindowPow2Sum += pow ( (iWindow[i] - iWindowAvg), 2);  //note double is same as float w/arduino
-  }
-  // Calculate RMS
-  iWindowPow2Mean = iWindowPow2Sum / len_iWindow;
-  iRMS = sqrt(iWindowPow2Mean);
-  rmsCurrentArray[channelNum] = iRMS;
-
-  // Serial.print("winavg: ");
-  // Serial.println(iWindowAvg);
-
-  // Serial.print("pow - winavg: ");
-  // Serial.println(iWindowPow2Mean);
-
-
-  Serial.print("min: ");
-  Serial.println(minval);
-  Serial.print("max: ");
-  Serial.println(maxval);
-
-}
-
-
-
-/*
-  void MeasureRMSCurrent2(int channelNum)
-  {
-  iWindowSum = 0;
-  iWindowAvg = 0;
-  iWindowPow2Sum = 0;
-  iWindowPow2Mean = 0;
-
-  // memset(iWindow, 0, sizeof(iWindow) / sizeof(iWindow[0])); // not necessary but probably a good idea for debugging
-
-  // Shift all data in the array left discard oldest data pt
-  for ( int i = 0; i < 200 - 1; i++ )
-  {
-    chan0rms_meas[i] = chan0rms_meas[i + 1];
-    iWindowSum += chan0rms_meas[i];
-  }
-
-  chan0rms_meas[0] = analogRead(iMeas[channelNum]);  // new meas data to last element in array
-   Serial.print("analog read: ");
-    Serial.println(chan0rms_meas[0]);
-  // Meas new data pt, append to array
-
-  iWindowSum += chan0rms_meas[0];
-
-  chan0avg = iWindowSum / 200;
-
-
-
-  // Remove DC component and calculate square
-  for ( int i = 0; i < len_iWindow; i++ )
-  {
-    iWindowPow2Sum += pow ( (chan0rms_meas[i] - chan0avg), 2);  //note double is same as float w/arduino
-  }
-
-  // Calculate RMS
-  iWindowPow2Mean = iWindowPow2Sum / 200;
-  iRMS = sqrt(iWindowPow2Mean);
-  rmsCurrentArray[channelNum] = iRMS;
-
-  }
-*/
 void printdebug(char* str, int flag)
 {
   if (flag)
@@ -1341,7 +1336,7 @@ void printdebug(char* str, int flag)
 // -------------------------------------------- Reboot logic -----------------------------
 
 
-void softReboot(void)
+void softRebootRPI(void)
 {
   // ------------------------------------------
   // Pull RPi pin12/GPIO-18 High for 1 sec
@@ -1349,16 +1344,16 @@ void softReboot(void)
   // Informs RPi to run sudo shutdown -r now
   // ------------------------------------------delay(1000);
   Serial.println("Soft Reboot RPi!");
-  Serial.println("PI_GPIO18_PIN12 toggle for 1 sec");
+  Serial.println("PI_GPIO18_PIN12 toggle HIGH for 1 sec");
   digitalWrite(PI_GPIO18_PIN12, HIGH);
   delay(1000);
-  Serial.println("Done");
-  Serial.println("PI_GPIO18_PIN12 returning to normal");
+
+  Serial.println("PI_GPIO18_PIN12 returning to normal(LOW)");
   digitalWrite(PI_GPIO18_PIN12, LOW);
   Serial.println("Done");
 }
 
-void hardReboot(void)
+void hardRebootRPI(void)
 {
   // ------------------------------------------------
   // Pull RPi Run low for 1 sec to reset/reboot
@@ -1389,9 +1384,9 @@ void rebootResolveI2C(void)
   //            2.1 soft reboot (up to maxNumSoftRebootTries)
   //            2.2 hard reboot if soft reboot tries exceeds maxNumSoftRebootTries
   //------------------------------------------------------------------------------
-  timeDeltaRx = millis() - timeStampMostRecentRx;
-  Serial.print("Main Loop: timeDeltaRx = ");
-  Serial.println(timeDeltaRx);
+  long timeDeltaRx = millis() - timeStampMostRecentRx;
+  // Serial.print("Main Loop: timeDeltaRx = ");
+  // Serial.println(timeDeltaRx);
 
   if (timeDeltaRx > 1000 && softRebootTryNum < maxNumSoftRebootTries)
   {
@@ -1403,54 +1398,87 @@ void rebootResolveI2C(void)
     Serial.println(maxNumSoftRebootTries);
     Serial.println("******************************");
 
-    softReboot();
-    Serial.print("Waiting ");
-    Serial.print(rebootWaitTimeMillis / 1000);
-    Serial.println("sec for RPi to boot");
-    delay(rebootWaitTimeMillis);
-    Serial.print(rebootWaitTimeMillis / 1000);  // By then an rx event should have occured
-    Serial.println(" seconds has elapsed");
+    softRebootRPI();
+    //Serial.print("Waiting ");
+    //Serial.print(REBOOT_WAITTIME_MS / 1000);
+    //Serial.println("sec for RPi to boot");
+    //delay(REBOOT_WAITTIME_MS);
+    //Serial.print(REBOOT_WAITTIME_MS / 1000);  // By then an rx event should have occured
+    //Serial.println(" seconds has elapsed");
     softRebootTryNum += 1;
+    timeLastRebootRequest = millis();
   }
 
   if (timeDeltaRx > 1000 && softRebootTryNum == maxNumSoftRebootTries)
   {
-    hardReboot();
-    delay(2000);          // long enough for PI to reboot
+    hardRebootRPI();
     softRebootTryNum = 0; // does it matter that this is after delay(45s)?
-    Serial.print("Waiting ");
-    Serial.print(rebootWaitTimeMillis / 1000);
-    Serial.println("sec for RPi to boot");
-    delay(rebootWaitTimeMillis);
-    Serial.print(rebootWaitTimeMillis / 1000);  // By then an rx event should have occured
-    Serial.println(" seconds has elapsed");
+    //Serial.print("Waiting ");
+    //Serial.print(REBOOT_WAITTIME_MS / 1000);
+    //Serial.println("sec for RPi to boot");
+    //delay(REBOOT_WAITTIME_MS);
+    //Serial.print(REBOOT_WAITTIME_MS / 1000);  // By then an rx event should have occured
+    //Serial.println(" seconds has elapsed");
+    timeLastRebootRequest = millis();
   }
 }
 
 
-void setPWMBanktoLevel(uint16_t level, int bank)
+void setPWMBankto100pct(int bank)
 {
-  if(bank == 0 || bank == 1)
+  int startindex = 0;
+  int endindex = 0;
+  int i = 0;
+  int dutyValueReverse = int(float(100 * 0.01) * 65535); // rising edge. (forward)
+  int dutyValueForward = int((1 - float(100 * 0.01)) * 65535); // falling edge, (reverse)
+
+  if (bank == 0 || bank == 1)
   {
-     analogWrite(pwmPin_HVL[0], level);
-     analogWrite(pwmPin_HVL[1], level);
-     analogWrite(pwmPin_HVL[2], level);
-     analogWrite(pwmPin_HVL[3], level);
+    startindex = 0;
+    endindex = 4;
   }
-  else if(bank == 2 || bank == 3)
+  else if (bank == 2 || bank == 3)
   {
-     analogWrite(pwmPin_HVL[4], level);
-     analogWrite(pwmPin_HVL[5], level);
-     analogWrite(pwmPin_HVL[6], level);
-     analogWrite(pwmPin_HVL[7], level);
+    startindex = 4;
+    endindex = 8;
   }
- 
+
+  for (i = startindex; i < endindex; i++)
+  {
+    // int val = pwmValue;
+    if (((dimmerEdge >> i) & 0x01) > 0) // if forward
+    {
+      analogWrite(pwmPin_HVL[i], dutyValueForward);
+      pwmData[i] = dutyValueForward;
+    }
+    else  // if reverse
+    {
+      if (dutyValueReverse == 0)
+        dutyValueReverse = 1;
+
+      analogWrite(pwmPin_HVL[i], dutyValueReverse);
+      pwmData[i] = dutyValueReverse;
+    }
+  }
+  // analogWrite(pwmPin_HVL[0], level);
+  // analogWrite(pwmPin_HVL[1], level);
+  // analogWrite(pwmPin_HVL[2], level);
+  // analogWrite(pwmPin_HVL[3], level);
+  // }
+  //else if (bank == 2 || bank == 3)
+  //{
+  // analogWrite(pwmPin_HVL[4], level);
+  // analogWrite(pwmPin_HVL[5], level);
+  // analogWrite(pwmPin_HVL[6], level);
+  // analogWrite(pwmPin_HVL[7], level);
+  //}
+
 
 }
 
-/*    for testing pupose only 
-void setFailoverRelay(int relaynumber, bool state)
-{
+/*    for testing pupose only
+  void setFailoverRelay(int relaynumber, bool state)
+  {
   if (state)
   {
     powerfailovermask |= (0x01 << (relaynumber - 1)); // set bit,
@@ -1460,8 +1488,87 @@ void setFailoverRelay(int relaynumber, bool state)
     powerfailovermask &= ~(0x01 << (relaynumber - 1)); // clear bit,
   }
   updateHVSR(dimmerEdge, dimmerRelayState);
-}
+  }
 **************************************/
+
+//********************************************* HV CURRENT MEAS (RMS) routines ****************
+///********************************************************************************************
+void MeasureHV_RMSCurrent()
+{
+  long currtime = micros();
+
+  // if we are ready to calc avg.
+  if (currtime - rms_sample_start_time >= rms_sample_length)   // sample window is 1 sec
+  {
+    long accum = rmsAccumHolder;
+    float avg = (float)accum / (float)num_samples_taken;
+    double powerSumation[20];
+
+    // Remove DC component and calculate square
+    for ( int i = 0; i < num_samples_taken; i++ )
+    {
+      float temp = (float)sampleHolder[i] - avg;
+      powerSumation[0] += pow ( temp, 2);
+    }
+
+    // Calculate RMS
+    long powerMean0 = powerSumation[0] / num_samples_taken; //num_samples_taken;
+    double RMS = sqrt(powerMean0);
+
+    // Serial.print("min max avg sample:  ");
+    // Serial.print(samplemin);
+    // Serial.print("  ");
+    // Serial.print(samplemax);
+    // Serial.print("  ");
+    // Serial.println(avg);
+    // Serial.print("  ");
+
+    // Serial.print("   power mean  ");
+    // Serial.print(powerMean0);
+
+    // Serial.print("   RMS :  ");
+    // Serial.println(RMS);
+
+    pwmcurrentstatus[0] = 16; //
+    uint16_t counts = (uint16_t)RMS;
+    pwmcurrentstatus[(rms_channel_meas * 2) + 1] = (counts >> 8) & 0xFF;   //msb
+    pwmcurrentstatus[(rms_channel_meas * 2) + 2] = counts & 0xFF; //(uint8_t)RMS;  // lsb, ;
+
+
+    // zero and reset for next measumrent.
+    rmsAccumHolder = 0;
+    num_samples_taken = 0;
+    rms_sample_start_time = currtime;
+    samplemin = 0xFFFF;
+    samplemax = 0;
+
+    memset(sampleHolder, 0, sizeof(sampleHolder));
+    rms_channel_meas++;  // inc to next channel.
+    if (rms_channel_meas > 7)
+    {
+      rms_channel_meas = 0;
+    }
+
+  }
+  else if (currtime - lastsampletime >= 10000) // take a sample every 10 ms
+  {
+    long temp = analogRead(iMeas[rms_channel_meas]);
+    rmsAccumHolder += temp;
+    sampleHolder[num_samples_taken] = temp; //store in a
+    lastsampletime = currtime;
+    num_samples_taken++;
+
+    if (temp > samplemax)
+      samplemax = temp;
+
+    if (temp < samplemin)
+      samplemin = temp;
+    // Serial.println("sample taken");
+  }
+
+}
+
+
 
 // Power failover pseudo code ****
 
@@ -1469,14 +1576,14 @@ void PowerFailOverTestAndHandle()
 {
   boolean changed = false;
   unsigned long current_timemillis = millis();
-  unsigned long FAILURE_TIME_MS = 2500;  // time in MS,  till power is said to be 0,  then wait anothe 1 sec... and start failover. 
-   
+  unsigned long FAILURE_TIME_MS = 2500;  // time in MS,  till power is said to be 0,  then wait anothe 1 sec... and start failover.
+
   boolean emergencypower_1_4  = ((current_timemillis - last_valid_power_src0) < FAILURE_TIME_MS);
   boolean linepower_1_4 = ((current_timemillis - last_valid_power_src1) < FAILURE_TIME_MS);
   boolean emergencypower_5_8  = ((current_timemillis - last_valid_power_src2) < FAILURE_TIME_MS);
   boolean linepower_5_8 = ((current_timemillis - last_valid_power_src3) < FAILURE_TIME_MS);
 
-   // Serial.print("line 1-4 power: "  );
+  // Serial.print("line 1-4 power: "  );
   //  Serial.println(linesense,HEX);
   // Serial.println(linepower_1_4);
 
@@ -1497,7 +1604,7 @@ void PowerFailOverTestAndHandle()
         hv_psource0 = false;
         // set all outputs to 100%
         Serial.println("setting outputs 1-4  to 100% and ignoring requests. ");
-        setPWMBanktoLevel(65535,0);
+        setPWMBankto100pct(0);
         failover_ignorerequests = 0x01;  // ignore all requests from outside,
         changed = true;
       }
@@ -1516,7 +1623,7 @@ void PowerFailOverTestAndHandle()
 
 
 
-   
+
   // line 5- 8 ***********************************************************
   //
   if (!linepower_5_8) //if 0
@@ -1535,7 +1642,7 @@ void PowerFailOverTestAndHandle()
         hv_psource1 = false;
         // set all outputs to 100%
         Serial.println("setting outputs (5-8) to 100% and ignoring requests. ");
-        setPWMBanktoLevel(65535,2);
+        setPWMBankto100pct(2);
         failover_ignorerequests = 0x01;  // ignore all requests from outside,
         changed = true;
       }
@@ -1547,30 +1654,30 @@ void PowerFailOverTestAndHandle()
     if (!hv_psource1) // if the 1-4 side is in emergency mode, pull it out.
     {
       Serial.println("line 5-8 power going back to UTILITY now (reset)  ");
-       hv_psource1 = true;
-     // powerfailovermask |= (0x01 << 1); // &= ~0x01; // clear the bit go back to utility,
+      hv_psource1 = true;
+      // powerfailovermask |= (0x01 << 1); // &= ~0x01; // clear the bit go back to utility,
       changed = true;
     }
   }
 
   //********************************************************************************
-   
+
   if (linepower_1_4 || linepower_5_8)
   {
     failover_ignorerequests = 0x00; // clear ignore flag,
   }
 
-  // if both lines are OK,  and both sources are set to AUX,  set both to line,  this is just a catch all,  
+  // if both lines are OK,  and both sources are set to AUX,  set both to line,  this is just a catch all,
   if (linepower_1_4 && linepower_5_8)
   {
-    if (!hv_psource0 && !hv_psource1)  
+    if (!hv_psource0 && !hv_psource1)
     {
       Serial.println("both lines are ok, and failover mask is not 0,  forceing back to 0");
       hv_psource0 = true;
       hv_psource0 = true;
       changed = true;
     }
-  }  
+  }
 
 
 
@@ -1580,7 +1687,7 @@ void PowerFailOverTestAndHandle()
   }
 
 
-    
+
 }
 
 
@@ -1613,71 +1720,72 @@ void printAllOutputConfigInfo()
   }
 
 
-   printHVSRInfo();
+  printHVSRInfo();
 }
 
 void printHVSRInfo()
 {
   Serial.println("psource0 | psource1  |  ac sens source mask");
- // Serial.print(hv_dimmerrelaystate, HEX);
- // Serial.print("  |  ");
+  // Serial.print(hv_dimmerrelaystate, HEX);
+  // Serial.print("  |  ");
   Serial.print(hv_psource0);
   Serial.print("   |     " );
   Serial.print(hv_psource1);
   Serial.print("   |      " );
   Serial.println(hv_ac_sens_src);
 
-  
+
 }
 
 // **************************************************************************
-// test code for flipping ac sens source 
-  //if(loopcount == 2)
-  //{
-    //Serial.println("on");
-     //  hv_psource0 = true;
-    
-    // setdimmerRelayState(1,true);
-     
-    //  setHV_AC_SENS_SRC(0);
-    //updateHVSR();
- // }
- // else if(loopcount == 1000000)
- // {
-     //Serial.println("off");
-     //   hv_psource0 = false;
-      //   updateHVSR();
-    
-   // setdimmerRelayState(1,false);
-    //  setHV_AC_SENS_SRC(1);
- // }
-  
-  // 
-  // ************************* TEST CODE FOR FLIPPING RELAYS ****
+// test code for flipping ac sens source
+//if(loopcount == 2)
+//{
+//Serial.println("on");
+//  hv_psource0 = true;
 
-  // loop test for normal output relays , channels 1- 8
- // if(loopcount == 200)
-  //  setdimmerRelayState(1,true);
-  // else if(loopcount == 700)
-  //   setdimmerRelayState(1,false);
+// setdimmerRelayState(1,true);
+
+//  setHV_AC_SENS_SRC(0);
+//updateHVSR();
+// }
+// else if(loopcount == 1000000)
+// {
+//Serial.println("off");
+//   hv_psource0 = false;
+//   updateHVSR();
+
+// setdimmerRelayState(1,false);
+//  setHV_AC_SENS_SRC(1);
+// }
+
+//
+// ************************* TEST CODE FOR FLIPPING RELAYS ****
+
+// loop test for normal output relays , channels 1- 8
+// if(loopcount == 200)
+//  setdimmerRelayState(1,true);
+// else if(loopcount == 700)
+//   setdimmerRelayState(1,false);
 
 
-  //if(loopcount == 200)
-  // setFailoverRelay(1,true);
-  // else if(loopcount == 700)
-  //    setFailoverRelay(1,false);
+//if(loopcount == 200)
+// setFailoverRelay(1,true);
+// else if(loopcount == 700)
+//    setFailoverRelay(1,false);
 
-  // if (loopcount == 200)
-  //{
-  // Serial.print("rms current chan 0:  ");
-  // Serial.println(rmsCurrentArray[0]);
+// if (loopcount == 200)
+//{
+// Serial.print("rms current chan 0:  ");
+// Serial.println(rmsCurrentArray[0]);
 
-  // }
-  /*  if(loopcount == 200)
-    {
-      byte val = shiftRegisterReadByte();
-       Serial.print("value read from shiftreg: ");
-      Serial.println(val,HEX);
-    }
+// }
+/*  if(loopcount == 200)
+  {
+    byte val = shiftRegisterReadByte();
+     Serial.print("value read from shiftreg: ");
+    Serial.println(val,HEX);
+  }
 
-  */
+*/
+

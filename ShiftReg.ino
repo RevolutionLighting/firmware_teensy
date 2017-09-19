@@ -98,6 +98,7 @@ void shiftRegisterWriteByte(int output)
   digitalWriteFast(SR_LAT,LOW);
 }
 
+/*
 void shiftRegisterWriteWord16(int output)
 {
  // Serial.println("shiftRegisterWriteWord16() called");
@@ -116,7 +117,51 @@ void shiftRegisterWriteWord16(int output)
   digitalWriteFast(SR_LAT,HIGH);
   delayMicroseconds(10);
   digitalWriteFast(SR_LAT,LOW);
+  
 }
+*/
+
+void shiftRegisterWriteWord16(int output)
+{
+ int delayus = 2;
+ // Serial.println("shiftRegisterWriteWord16() called");
+  byte i=0;
+  for (i=0;i<16;i++)
+  {
+    if((output&0x8000)==0x8000) digitalWriteFast(SR_DAT,HIGH);
+    else digitalWriteFast(SR_DAT,LOW);
+    delayMicroseconds(delayus);
+    digitalWriteFast(SR_CLK,HIGH);
+    delayMicroseconds(delayus);
+    digitalWriteFast(SR_CLK,LOW);
+    delayMicroseconds(delayus);
+    output<<=1;
+  }
+  digitalWriteFast(SR_LAT,HIGH);
+  delayMicroseconds(10);
+  digitalWriteFast(SR_LAT,LOW);
+  
+}
+
+
+/*void shiftRegisterWriteWord16_v2(int output)
+{
+ // Serial.println("shiftRegisterWriteWord16() called");
+  byte i=0;
+  uint8_t bitout;
+  
+   digitalWriteFast(SR_LAT,LOW);
+  for (i=0;i<16;i++)
+  {
+     bitout = (output >> i) & 0x01;
+     
+    shiftOut(SR_DAT, SR_CLK, LSBFIRST, bitout);
+   // output<<=1;
+  }
+  digitalWriteFast(SR_LAT,HIGH);
+ 
+ 
+}*/
 
 void shiftRegisterWriteWord24(int output)
 {
