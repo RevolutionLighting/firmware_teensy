@@ -1,11 +1,14 @@
 //-------------------------------------------------------------------------------------
 // Revolution Lighting Project Firmware
 //-------------------------------------------------------------------------------------
+// version 1.1
+// fixed issue with version number not getting accross.
+// unified the pwm current meas into one func for both hv and lv.
+// passed LV test 9/20/17
+
 // Version 1.0
 // Added HV phase support new way,
 // passes lv board test 9/14/17
-//
-//
 
 // Version 0.9
 // Changed ain freq from 10K to 200 hz becuase of shared timer  issue ftm0/1,2,3... between
@@ -66,11 +69,12 @@
 // (6) resolved event handler crashes
 // (7) started commenting/refactoring code for readability
 //-------------------------------------------------------------------------------------
-#define RELEASENUMBERMAJOR 1
-#define RELEASENUMBERMINOR 0
-#define LV_HV 1 //LV=0, HV=1
+uint8_t RELEASENUMBERMAJOR = 1;
+uint8_t RELEASENUMBERMINOR = 1;
+#define LV_HV 0 //LV=0, HV=1
 #include <arduino.h>
 #include <i2c_t3.h>
+boolean MEASURE_LOOPTIME = true;
 
 boolean DebugRMSCurrent = true;
 boolean TestFlag = true;
@@ -99,11 +103,11 @@ void enQueue(uint8_t * data, int length);
 void printQueue(void);
 void deQueuebuff(uint8_t * rxdata);
 void TxVersionInfo(void);  // sends out version info, util func.
-
+void MeasurePWMOutputCurrent(void);
 // methods for measurements
 void MeasureWetDryContactInputs(void);
 void MeasureZero2TenInputs(void);
-void MeasureLV_PWMCurrent(void);   // take pwm current measurment
+//void MeasureLV_PWMCurrent(void);   // take pwm current measurment
 
 
 // routines for set hw
@@ -180,7 +184,7 @@ volatile uint8_t received;                              // ***
 uint16_t pwmData[] = {0x0000, 0x0000, 0x0000, 0x0000,   // ***
                       0x0000, 0x0000, 0x0000, 0x0000
                      };
-                     
+
 //-------------------------------------------------------------------------------------
 // *** QUEUE Globals
 //-------------------------------------------------------------------------------------
@@ -271,7 +275,7 @@ float last_5_8_freq = 120.00;  //for debug.
 
 int current0_10_meas_index = 0;  // 0 -3  used for the 0-10 volt measuring ,  inc'd per X number of cycles,
 
-// for debug,  measuring cycle (loop) times. 
+// for debug,  measuring cycle (loop) times.
 long test_last_loop_us = 0;
 float maxcycletime = 0;
 float avgcycletime = 0.0;
@@ -280,17 +284,18 @@ float mincycletime = 0xFFFFF;
 
 
 // NGP --- new hv current meas stuff 9/19/17
-long rms_sample_length = 1000000; //16600; // in US,  1 full cycle  60Hz
+
 long rms_sample_start_time = 0;
 
 uint8_t rms_channel_meas = 0;  // which channel are we measuing.
 unsigned long rmsAccumHolder = 0;  // holds current accum value.
 unsigned long lastsampletime = 0;   // time stamp of when last sampel was read in and added to accum
 unsigned long num_samples_taken = 0;  // number of samples taken ,(divistor to calc avg. )
-unsigned long sampleHolder[200];  // holds samples during measurment cycle. 
-unsigned long samplemin = 0xFFFF;  //debug only 
-unsigned long samplemax = 0;  //debug only 
+unsigned long sampleHolder[1000];  // holds samples during measurment cycle.
+unsigned long samplemin = 0xFFFF;  //debug only
+unsigned long samplemax = 0;  //debug only
 
+uint8_t hw_info_buff[4]; // hw info buff/  board type/version
 // -------------------------------------------------------------------------------------------
 
 void setup()
@@ -374,6 +379,8 @@ void setup()
   Serial.begin(115200);
   Serial.println("Teensy Setup has run! We've Booted!");
 
+  Serial.print("Board Type: ");
+  Serial.println(LV_HV);
   //delay must take place before interupt handlers are enabled
   delay(1000);
 
@@ -388,28 +395,6 @@ void setup()
   // Write shiftreg
   shiftRegisterWriteWord16(0x0001);
 
-
-
-  // Print RMS current measurement settings:
-  //     printdebug("Testing Print Debug\n", DebugRMSCurrent);
-  //     printdebug("RMS Current Sampling: Samples/Sec = ", DebugRMSCurrent);
-  //     //printdebug(samplesPerSec, DebugRMSCurrent);
-  //     printdebug("\n", DebugRMSCurrent);
-
-  /*   Serial.print("Window Len (sec) = ");
-     Serial.println(windowLenSecs);
-     Serial.println("");
-
-     Serial.print("Data points in iWindow[N] = ");
-     Serial.println(len_iWindow);
-     Serial.println("");
-
-     Serial.print("Sample Period = ");
-     Serial.print(iSamplePeriod);
-     Serial.println(" mS");
-     Serial.println("");*/
-
-  //     printf("This is my first time using arduino printf %f", 3.14);
   Serial.println("loop start");
 
   last_valid_power_src0 = millis();
@@ -430,6 +415,12 @@ void setup()
     attachInterrupt(digitalPinToInterrupt(SR_DAT_IN), ZeroCrossISR, FALLING);
     setNextACSensSrc();
   }
+
+  // HW INFO BUFFER SETUP
+  hw_info_buff[0] = 3;
+  hw_info_buff[1] = LV_HV;
+  hw_info_buff[2] = RELEASENUMBERMAJOR;
+  hw_info_buff[3] = RELEASENUMBERMINOR;
 
 
 }	// End setup()
@@ -547,12 +538,9 @@ void loop()
   }
 
   // measurement routines
-
-  if (LV_HV == 0)
-  {   
-    MeasureLV_PWMCurrent();
-  }
-
+  // PWM output current(both HV / LV) ,
+  // MeasureLV_PWMCurrent(); // org lv version
+  MeasurePWMOutputCurrent(); // unified non blocking,  per channel... periodic.
 
   // ********************************************************************************************************
   // ****************************************************************** HV********************
@@ -591,20 +579,8 @@ void loop()
       setNextACSensSrc();
     }
 
-
     PowerFailOverTestAndHandle();
-
-
-
-
-    //*********************************************************************************
-    // HV RMS Current Sampling
-    // approx calc is 9 counts per mA... as of 9/19/17
-    MeasureHV_RMSCurrent();
-    // *********************************************** END RMS ***********************
-
   }  // end if HV
- 
 
   // ******************************************************************************************
   // RESET OF RPI LOGIC  /soft/hard
@@ -639,60 +615,47 @@ void loop()
   loopcount++;                 //10000 == 25ms,
   if (loopcount >= 100000)     // 40000 == 100ms,
   {
-    // Serial.println(micros());
+
     loopcount = 0;
     MeasureZero2TenInputs();  // this is non blocking. ...
     // NOTE ,  100000 is the slowest time allowed ,  for now,  other wise you will miss the clicks.
     MeasureWetDryContactInputs();  // this is non  blocking, but must be dont fast enough to pick up clicks.
 
 
-    //long temp_val = analogRead(iMeas[0]);
-    //  Serial.println(temp_val);
-    /*
-        Serial.print("looptime max: " );
-        Serial.print(maxcycletime);
 
-        Serial.print(" min: " );
-        Serial.print(mincycletime);
+    if (MEASURE_LOOPTIME)
+    {
+      Serial.print("looptime max: " );
+      Serial.print(maxcycletime);
 
-        float avg = avgcycletime / (float)100000;
+      Serial.print(" min: " );
+      Serial.print(mincycletime);
 
-        Serial.print(" avg: " );
-        Serial.println(avg);
+      float avg = avgcycletime / (float)100000;
 
-        avgcycletime = 0;
-        maxcycletime = 0;
-        mincycletime = 10000.0;
-    */
-    // Serial.print("ZC_ISR MEAS TIME HZ: ");
+      Serial.print(" avg: " );
+      Serial.println(avg);
 
-    // float avg_freq = (float)1000000 / (float)lastisr_meas;
-    // float basefreq = 2.00 * avg_freq;
-
-    // Serial.print(hv_ac_sens_src);
-    // Serial.print("   ");
-    // Serial.println (avg_freq);
+      avgcycletime = 0;
+      maxcycletime = 0;
+      mincycletime = 10000.0;
+    }
 
   }
 
-
-
-  long markmicros = micros();
-  float deltatime = (float)(markmicros - test_last_loop_us);
-  if (deltatime > maxcycletime)
+  if (MEASURE_LOOPTIME)
   {
-    maxcycletime = deltatime;
+    long markmicros = micros();
+    float deltatime = (float)(markmicros - test_last_loop_us);
+    if (deltatime > maxcycletime)
+      maxcycletime = deltatime;
+
+    if (deltatime < mincycletime)
+      mincycletime = deltatime;
+
+    test_last_loop_us = markmicros;
+    avgcycletime += deltatime;
   }
-
-  if (deltatime < mincycletime)
-  {
-    mincycletime = deltatime;
-  }
-
-  test_last_loop_us = markmicros;
-
-
-  avgcycletime += deltatime;
 
 
   // test code for reset countdown....loop, till reset.
@@ -712,6 +675,42 @@ void loop()
 
 
 } // end main loop()
+
+
+
+void MeasureLV_PWMCurrent()
+{
+
+  for (int i = 0; i < 8; i++)
+  {
+    pwm_sample_data[i] += analogRead(iMeas[i]);
+  }
+  pwmcurrentsamplecount++; //for div
+
+  if (pwmcurrentsamplecount > 2000)
+  {
+    //  Serial.println("PWM measurment done");
+    memset(pwmcurrentstatus, 0, sizeof(pwmcurrentstatus));
+    pwmcurrentstatus[0] = 16;
+    for (int i = 0; i < 8; i++)
+    {
+      pwm_sample_data[i] /= pwmcurrentsamplecount;
+      pwmcurrentstatus[(2 * i) + 1] = char(pwm_sample_data[i] / 256);
+      pwmcurrentstatus[(2 * i) + 2] = char(pwm_sample_data[i] & 0xFF);
+    }
+
+    //   Serial.print(" pwm sample data0: " );
+    //  Serial.println(pwm_sample_data[0]);
+
+    pwmcurrentsamplecount = 0;
+    memset(pwm_sample_data, 0, sizeof(pwm_sample_data));
+
+  }
+}
+
+
+
+
 
 void setNextACSensSrc()
 {
@@ -899,8 +898,10 @@ void requestEvent(void)
   // addr = command byte requested by Node i2c
   // ------------------------------------------
 
-  if (pending_get_command == VERSION)            // 0 -
-    TxVersionInfo();
+  if (pending_get_command == VERSION)
+  {
+    Wire.write(hw_info_buff, 4);
+  }
 
   if (pending_get_command == IMEAS)
     Wire.write(pwmcurrentstatus, 17);
@@ -919,19 +920,6 @@ void requestEvent(void)
   }
 
   pending_get_command = 0xff; // clear it
-
-  /*  still to do for hv board ----------------------------------------<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<< to do .
-    //  if (addr==VIN)                // 9
-    //  {
-    //    databuf[0]=2;
-
-    //    int data=analogRead(vinSense);
-    //    databuf[1]=char(data/256);
-    //    databuf[2]=char(data&0xFF);
-    //  }
-    Wire.write(databuf, MEM_LEN); // fill Tx buffer (send full mem)
-  */
-
 }
 
 
@@ -1100,15 +1088,18 @@ void MeasureWetDryContactInputs()
   //  Serial.println(wetdrycontactstatus[1],HEX);
 }
 
+
 void TxVersionInfo()
 {
-  uint8_t txbuff[4];
+  //uint8_t txbuff[4];
   Serial.println("got version request, sending now" );
-  txbuff[0] = 3;
-  txbuff[1] = LV_HV;
-  txbuff[2] = RELEASENUMBERMAJOR;
-  txbuff[3] = RELEASENUMBERMINOR;
-  Wire.write(txbuff, 4);
+  hw_info_buff[0] = 3;
+  hw_info_buff[1] = LV_HV;
+  hw_info_buff[2] = 0x02; //RELEASENUMBERMAJOR;
+  hw_info_buff[3] = 0x06; //RELEASENUMBERMINOR;
+
+
+  Wire.write(hw_info_buff, 4);
 }
 
 void MeasureZero2TenInputs()
@@ -1154,35 +1145,6 @@ void MeasureZero2TenInputs()
 
 
 
-}
-
-
-
-void MeasureLV_PWMCurrent()
-{
-
-  for (int i = 0; i < 8; i++)
-  {
-    pwm_sample_data[i] += analogRead(iMeas[i]);
-  }
-  pwmcurrentsamplecount++; //for div
-
-  if (pwmcurrentsamplecount > 2000)
-  {
-    //  Serial.println("PWM measurment done");
-    memset(pwmcurrentstatus, 0, sizeof(pwmcurrentstatus));
-    pwmcurrentstatus[0] = 16;
-    for (int i = 0; i < 8; i++)
-    {
-      pwm_sample_data[i] /= pwmcurrentsamplecount;
-      pwmcurrentstatus[(2 * i) + 1] = char(pwm_sample_data[i] / 256);
-      pwmcurrentstatus[(2 * i) + 2] = char(pwm_sample_data[i] & 0xFF);
-    }
-
-    pwmcurrentsamplecount = 0;
-    memset(pwm_sample_data, 0, sizeof(pwm_sample_data));
-
-  }
 }
 
 
@@ -1493,77 +1455,144 @@ void setPWMBankto100pct(int bank)
 
 //********************************************* HV CURRENT MEAS (RMS) routines ****************
 ///********************************************************************************************
-void MeasureHV_RMSCurrent()
+void MeasurePWMOutputCurrent()
 {
   long currtime = micros();
-
+  pwmcurrentstatus[0] = 16; // set first byte as messgae type.
   // if we are ready to calc avg.
-  if (currtime - rms_sample_start_time >= rms_sample_length)   // sample window is 1 sec
+  long sample_window_time_us = 1000000; // how long to samples for (total window)  1 sec
+  long sample_slice_us = 10000; //time between sample. 10 ms
+
+  if (LV_HV == 0)
   {
-    long accum = rmsAccumHolder;
-    float avg = (float)accum / (float)num_samples_taken;
-    double powerSumation[20];
-
-    // Remove DC component and calculate square
-    for ( int i = 0; i < num_samples_taken; i++ )
+    sample_slice_us = 400;
+    //sample_window_time_us = 1000000;  //X us sample window
+    //sample_slice_us = 1000; //5ms; // X us between sample
+    // every cycle,  take one sample from current channel .
+    if ((currtime - lastsampletime) >= sample_slice_us)
     {
-      float temp = (float)sampleHolder[i] - avg;
-      powerSumation[0] += pow ( temp, 2);
+      pwm_sample_data[rms_channel_meas] += analogRead(iMeas[rms_channel_meas]);
+      rms_channel_meas++;  // inc to next channel.
+      lastsampletime = currtime;
+
+      if (rms_channel_meas > 7)
+      {
+        rms_channel_meas = 0;
+        pwmcurrentsamplecount++; // this is how many samples total we have taken. per channel.
+      }
+
+      if (pwmcurrentsamplecount > 500)  // once we have 2 k samples.
+      {
+        //  Serial.println("PWM measurment done");
+        memset(pwmcurrentstatus, 0, sizeof(pwmcurrentstatus));
+        pwmcurrentstatus[0] = 16;
+        for (int i = 0; i < 8; i++)
+        {
+          pwm_sample_data[i] /= pwmcurrentsamplecount;
+          pwmcurrentstatus[(2 * i) + 1] = char(pwm_sample_data[i] / 256);
+          pwmcurrentstatus[(2 * i) + 2] = char(pwm_sample_data[i] & 0xFF);
+        }
+        pwmcurrentsamplecount = 0;
+        memset(pwm_sample_data, 0, sizeof(pwm_sample_data));
+      }
     }
-
-    // Calculate RMS
-    long powerMean0 = powerSumation[0] / num_samples_taken; //num_samples_taken;
-    double RMS = sqrt(powerMean0);
-
-    // Serial.print("min max avg sample:  ");
-    // Serial.print(samplemin);
-    // Serial.print("  ");
-    // Serial.print(samplemax);
-    // Serial.print("  ");
-    // Serial.println(avg);
-    // Serial.print("  ");
-
-    // Serial.print("   power mean  ");
-    // Serial.print(powerMean0);
-
-    // Serial.print("   RMS :  ");
-    // Serial.println(RMS);
-
-    pwmcurrentstatus[0] = 16; //
-    uint16_t counts = (uint16_t)RMS;
-    pwmcurrentstatus[(rms_channel_meas * 2) + 1] = (counts >> 8) & 0xFF;   //msb
-    pwmcurrentstatus[(rms_channel_meas * 2) + 2] = counts & 0xFF; //(uint8_t)RMS;  // lsb, ;
-
-
-    // zero and reset for next measumrent.
-    rmsAccumHolder = 0;
-    num_samples_taken = 0;
-    rms_sample_start_time = currtime;
-    samplemin = 0xFFFF;
-    samplemax = 0;
-
-    memset(sampleHolder, 0, sizeof(sampleHolder));
-    rms_channel_meas++;  // inc to next channel.
-    if (rms_channel_meas > 7)
-    {
-      rms_channel_meas = 0;
-    }
-
   }
-  else if (currtime - lastsampletime >= 10000) // take a sample every 10 ms
+  else
   {
-    long temp = analogRead(iMeas[rms_channel_meas]);
-    rmsAccumHolder += temp;
-    sampleHolder[num_samples_taken] = temp; //store in a
-    lastsampletime = currtime;
-    num_samples_taken++;
 
-    if (temp > samplemax)
-      samplemax = temp;
 
-    if (temp < samplemin)
-      samplemin = temp;
-    // Serial.println("sample taken");
+    if ((currtime - rms_sample_start_time) >= sample_window_time_us)   // sample window is 1 sec
+    {
+      // Serial.print("********");
+      // Serial.println(currtime);
+      // Serial.println(rmsAccumHolder);
+      long accum = rmsAccumHolder;
+      float avg = (float)accum / (float)num_samples_taken;
+
+      uint16_t counts = 0;
+      //if (LV_HV == 1)  // if HV do rms calc
+      // {
+      double powerSumation;
+
+      // Remove DC component and calculate square
+      for ( int i = 0; i < num_samples_taken; i++ )
+      {
+        float temp = (float)sampleHolder[i] - avg;
+        powerSumation += pow ( temp, 2);
+      }
+
+      // Calculate RMS
+      long powerMean0 = powerSumation / num_samples_taken; //num_samples_taken;
+      double RMS = sqrt(powerMean0);
+
+      counts = (uint16_t)RMS;  // convert the float to a uint16,
+      //  }
+      // else if (LV_HV == 0) // if lv
+      //{
+      //  counts = (uint16_t)avg;  // just take avg.
+      // }
+
+
+      pwmcurrentstatus[(rms_channel_meas * 2) + 1] = counts / 256; //(counts >> 8) & 0xFF;   //msb
+      pwmcurrentstatus[(rms_channel_meas * 2) + 2] = counts & 0xFF; //(uint8_t)RMS;  // lsb, ;
+
+      // for debug  ..**********************************
+      Serial.print("samplecount:   min max counts  avg  counts:  ");
+
+      Serial.print(num_samples_taken);
+      Serial.print("   :  ");
+      // Serial.print(samplemin);
+      //Serial.print("  ");
+      //Serial.print(samplemax);
+      //Serial.print("  ");
+      Serial.println(counts);
+      // Serial.print("  ");
+      // Serial.println(avg);
+      // Serial.print("  ");
+
+      // Serial.print("   power mean  ");
+      // Serial.print(powerMean0);
+
+      // Serial.print("   RMS :  ");
+      // Serial.println(RMS);
+      // *********************************************
+      // zero and reset for next measumrent.
+      rmsAccumHolder = 0;
+      num_samples_taken = 0;
+      rms_sample_start_time = currtime;
+      samplemin = 0xFFFF;
+      samplemax = 0;
+
+      memset(sampleHolder, 0, sizeof(sampleHolder));
+      rms_channel_meas++;  // inc to next channel.
+      if (rms_channel_meas > 7)
+      {
+        rms_channel_meas = 0;
+      }
+
+    }
+    else if ((currtime - lastsampletime) >= sample_slice_us) // take a sample every 10 ms
+    {
+      // Serial.print("^^^^^^^^");
+      // Serial.println(currtime);
+      long temp = analogRead(iMeas[rms_channel_meas]);
+
+      rmsAccumHolder += temp;
+      if (LV_HV == 1)  // if HV do rms calc
+        sampleHolder[num_samples_taken] = temp;
+
+
+      lastsampletime = currtime;
+      num_samples_taken++;
+
+      if (temp > samplemax)
+        samplemax = temp;
+
+      if (temp < samplemin)
+        samplemin = temp;
+      // Serial.println("sample taken");
+    }
+
   }
 
 }
@@ -1686,10 +1715,7 @@ void PowerFailOverTestAndHandle()
     updateHVSR();
   }
 
-
-
 }
-
 
 // debug print routines. **************************************************
 void printOutputConfigInfo(int outputnumber)
