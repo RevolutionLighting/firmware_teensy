@@ -1,6 +1,10 @@
 //-------------------------------------------------------------------------------------
 // Revolution Lighting Project Firmware
 //-------------------------------------------------------------------------------------
+
+//version 1.2
+// rev d hvh bringup
+
 // version 1.1
 // fixed issue with version number not getting accross.
 // unified the pwm current meas into one func for both hv and lv.
@@ -70,11 +74,13 @@
 // (7) started commenting/refactoring code for readability
 //-------------------------------------------------------------------------------------
 uint8_t RELEASENUMBERMAJOR = 1;
-uint8_t RELEASENUMBERMINOR = 1;
-#define LV_HV 0 //LV=0, HV=1
+uint8_t RELEASENUMBERMINOR = 2;
+#define LV_HV 1 //LV=0, HV=1
 #include <arduino.h>
 #include <i2c_t3.h>
-boolean MEASURE_LOOPTIME = true;
+boolean MEASURE_LOOPTIME = false;
+
+boolean HV_POWER_FAILOVER = true;
 
 boolean DebugRMSCurrent = true;
 boolean TestFlag = true;
@@ -296,6 +302,27 @@ unsigned long samplemin = 0xFFFF;  //debug only
 unsigned long samplemax = 0;  //debug only
 
 uint8_t hw_info_buff[4]; // hw info buff/  board type/version
+
+
+// 9/29/16
+// new output relay shutoffs
+uint8_t bias_enable = 0xFF;
+
+unsigned long bitwigglecount = 0;
+
+
+unsigned long delaypwmupdate_ms = 0;
+boolean togglebias = false;
+
+
+enum ZERO_CROSS_MEAS_STATE {
+  MEASURING,
+  SWITCH_SRC,
+  WAITING_TO_SETTLE
+};
+
+ZERO_CROSS_MEAS_STATE zero_cross_state = MEASURING;
+
 // -------------------------------------------------------------------------------------------
 
 void setup()
@@ -395,7 +422,7 @@ void setup()
   // Write shiftreg
   shiftRegisterWriteWord16(0x0001);
 
-  Serial.println("loop start");
+  Serial.println("loop start-- 9 ");
 
   last_valid_power_src0 = millis();
   last_valid_power_src1 = millis();
@@ -432,6 +459,19 @@ volatile float lastisr_meas = 0.0;
 //****************************************************************************************************
 // ********************************************* Zero Cross ISR **************************************
 
+// NOTES:  10/23/17,
+//zero cross count states:
+// 0 = measuring window state, if here, isr will taking in counts  next state -1,
+// -1 == tell system to switch the source number,  then go into -2,
+// -2  = wait sate, used to wait between measurment windows. look in loop for duration (approx 3 ms) next state is 0,
+
+
+// as of board rev D.  here is the pin/port mapping
+// Sens0 - Aux0     
+// Sens1 - Line 0              
+// Sens2 - Aux1
+// Sens3 - Line 1
+
 //****************************************************************************************************
 void ZeroCrossISR() {
 
@@ -441,7 +481,8 @@ void ZeroCrossISR() {
     PULSE_CNT_LIMIT = 4;// do 6 pulses just for aux inputs,  to save time,
 
 
-  if (zc_isr_count >= 0)
+// if in measuing state. 
+  if(zero_cross_state == MEASURING) // if (zc_isr_count >= 0)
   {
     if (zc_isr_count == 0)
       isr_start_meas = micros();
@@ -457,31 +498,41 @@ void ZeroCrossISR() {
       float basefreq = 2.00 * avg_freq;
 
       // isr_start_meas = micros();
-
-      if (avg_freq > 58 && avg_freq < 62)
+      // if (avg_freq > 58 && avg_freq < 62)  10/23 changed thresh to 120,,
+      if (basefreq > 118 && basefreq < 122)   // <--------------note only update if in valid range.
       {
-        if (hv_ac_sens_src == 0 || hv_ac_sens_src == 3)
-          setPWMBaseFrequency(basefreq, hv_ac_sens_src);  // <--------------note only update if in valid range.
+
+        
+        Serial.print(getAC_SensSrcName(hv_ac_sens_src));
+        Serial.print(" : ");
+        Serial.println(basefreq);
+        
+        
+        
+        if (hv_ac_sens_src == 1 || hv_ac_sens_src == 3)
+          setPWMBaseFrequency(basefreq, hv_ac_sens_src); 
         // update presense times
+
         switch (hv_ac_sens_src)
         {
-          case 0:
+          case 0:  // aux 0
             last_valid_power_src0 = millis();
             break;
-          case 1:
+          case 1:   // line 0
             last_valid_power_src1 = millis();
             break;
-          case 2:
+          case 2:   // aux 1
             last_valid_power_src2 = millis();
             break;
-          case 3:
+          case 3:   // line 1
             last_valid_power_src3 = millis();
             break;
           default:
             break;
         }
       }
-      zc_isr_count = -1;  // set it to wait state
+       zero_cross_state = SWITCH_SRC;
+       //zc_isr_count = -1;  //
     }
   }
 
@@ -501,10 +552,11 @@ void loop()
   // *********************************************************
   if (rxdata[0] != 0xff)
   {
-    Serial.print("valid data received; command byte = ");
-    Serial.println(rxdata[0]);
-    if (failover_ignorerequests == 0x00)
-    {
+    //Serial.print("valid data received; command byte = ");
+    //Serial.println(rxdata[0]);
+    
+    //if (failover_ignorerequests == 0x00)
+    //{
       switch (rxdata[0])
       {
         case 0x01:
@@ -525,11 +577,11 @@ void loop()
         default:
           break;
       }// end switch
-    }
-    else
-    {
-      Serial.println(" command ignored,  in failover mode");
-    }
+   // }
+   // else
+   // {
+   //   Serial.println(" command ignored,  in failover mode");
+   // }
   }
   else
   {
@@ -539,7 +591,6 @@ void loop()
 
   // measurement routines
   // PWM output current(both HV / LV) ,
-  // MeasureLV_PWMCurrent(); // org lv version
   MeasurePWMOutputCurrent(); // unified non blocking,  per channel... periodic.
 
   // ********************************************************************************************************
@@ -547,25 +598,27 @@ void loop()
   // ********************************************************************************************************
   if (LV_HV == 1)
   {
-
-    // this is proto for pwm way
-    // simple check for zero cross, and after X sec, (last sync,  reset the timer(ftm3) to 0,  to sync it, to zero cross.
+    // Start of zero cross state machine advance /test code.
+    // Zero cross is measured using isr counts,  in isr routine above, but state is tested here,  and advanced
 
     unsigned long current_timemicros = micros();
     unsigned long current_timemillis = millis();
 
-    if (zc_isr_count == -1) // switch source
+    //if (zc_isr_count == -1) // switch source
+    if(zero_cross_state == SWITCH_SRC)
     {
       setNextACSensSrc();
 
-      zc_isr_count = -2;
-      // zc_isr_count = 0;
+       zero_cross_state = WAITING_TO_SETTLE;
+     // zc_isr_count = -2;
+      
     }
-    else if (zc_isr_count == -2)
+    else if (zero_cross_state == WAITING_TO_SETTLE)  // else if (zc_isr_count == -2)
     {
-      if (current_timemillis - last_hv_ac_sens_src_switch_mills >= 3)
+      if (current_timemillis - last_hv_ac_sens_src_switch_mills >= 10)  // if over the settle period. 
       {
-        zc_isr_count = 0;  // go back to in meas.
+        zero_cross_state = MEASURING;
+        zc_isr_count = 0;  // reset the isr count
       }
 
     }
@@ -573,13 +626,22 @@ void loop()
     // if last time has been more than 1000 ms,  then timeout.  and auto switch(in caes pwr src is not present.
     if (current_timemillis - last_hv_ac_sens_src_switch_mills > 1000)
     {
-      zc_isr_count = -2;
-      //  Serial.print(getAC_SensSrcName(hv_ac_sens_src));
-      //  Serial.println(" (TIMEOUT: !) = assumed 0 ");
+       zero_cross_state = WAITING_TO_SETTLE;
+     // zc_isr_count = -2;
+      Serial.print(getAC_SensSrcName(hv_ac_sens_src));
+      Serial.println(" (TIMEOUT: !) = assumed 0 ");
       setNextACSensSrc();
     }
+    // **********************  end zero cross state machine code *************************
+    // ***********************************************************************************
 
-    PowerFailOverTestAndHandle();
+    // *************************************************************************************
+    // ****** Power failover Handler/check for HV only *************************************
+    // *************************************************************************************
+    if(HV_POWER_FAILOVER)
+        PowerFailOverTestAndHandle();
+
+        
   }  // end if HV
 
   // ******************************************************************************************
@@ -657,10 +719,11 @@ void loop()
     avgcycletime += deltatime;
   }
 
-
+  //*****************************************************************
   // test code for reset countdown....loop, till reset.
-
+  // *******************************************************************
   /*if(temp_softreset_countdown > 0)
+
     {
      temp_softreset_countdown--;
      if(temp_softreset_countdown == 0)
@@ -671,9 +734,6 @@ void loop()
     }
   */
   // end countdown test ***************************
-
-
-
 } // end main loop()
 
 
@@ -710,7 +770,11 @@ void MeasureLV_PWMCurrent()
 
 
 
-
+// as of board rev D.  here is the pin/port mapping
+// Sens0 - Aux0     
+// Sens1 - Line 0              
+// Sens2 - Aux1
+// Sens3 - Line 1
 
 void setNextACSensSrc()
 {
@@ -722,6 +786,7 @@ void setNextACSensSrc()
   // }
   //  else
   //   nextsrc = 1;
+
 
   switch (hv_ac_sens_src)
   {
@@ -740,6 +805,7 @@ void setNextACSensSrc()
     default:
       break;
   }
+   
 
   setHV_AC_SENS_SRC(nextsrc);
 }
@@ -774,8 +840,8 @@ void setPWMBaseFrequency(float freq, int bank) // boolean forward)
   }
   else if (bank == 2 || bank == 3)              // NOTE ,  these are all on FTM 0
   {
-    //Serial.print("bank 2/3 freq: ");
-    // Serial.println(freq);
+    // Serial.print("bank 2/3 freq: ");
+    //  Serial.println(freq);
     analogWriteFrequency(pwmPin_HVL[4], freq);
 
 
@@ -799,51 +865,106 @@ void setPWMBaseFrequency(float freq, int bank) // boolean forward)
 
 void setPWMState(uint8_t * pwmvals)
 {
-  Serial.print("pwmvals: ");
+  Serial.print(" hv dim mode max : ");
+  Serial.println(hv_dimmermode);
+
+
+  Serial.print("pct |  pwmvals: ");
+
+
+
 
   for (int i = 0; i < 8; i++)
   {
     int pwmValue = pwmvals[(2 * i) + 1] * 256 + pwmvals[(2 * i) + 2];  // extract value from array that is sent over. from host.
     int pct = (pwmValue * 100) / 65535;  // convert it to a pct value.
 
-    int dutyValueReverse = int(float(pct * 0.01) * 65535); // rising edge. (forward)
-    int dutyValueForward = int((1 - float(pct * 0.01)) * 65535); // falling edge, (reverse)
-
-    //Serial.print(dutyValueForward);
-    //Serial.print(" | ");
-    //Serial.print(dutyValueReverse);
-    //Serial.print(" | ");
-    // Serial.print(pwmValue);
-    //Serial.print(" | ");
-    Serial.print(pct);
-    Serial.print(" | ");
-
 
     if (LV_HV == 0)   // 8/23/17,   only for lv now.
     {
+      Serial.print(" | ");
+      Serial.print(pct);
+      Serial.print(" | ");
       analogWrite(pwmPin[i], pwmValue);
       pwmData[i] = pwmValue; // store value for ref
     }
     else  // HV
     {
-      int val = pwmValue;
-      if (((dimmerEdge >> i) & 0x01) > 0) // if forward
+
+      // 0 == phase, 1 0-10, dim,
+      bool isPhaseDim = ((hv_dimmermode & (0x01 << i)) <= 0);
+
+      int appliedpct = pct;
+      if (isPhaseDim)
       {
-        analogWrite(pwmPin_HVL[i], dutyValueForward);
-        pwmData[i] = dutyValueForward;
+        if (pct >= 80)
+          appliedpct = 80;
 
-      }
-      else  // if reverse
+
+
+
+        uint16_t dutyValueReverse = uint16_t(float(appliedpct * 0.01) * 65535); // rising edge. (forward)
+        uint16_t dutyValueForward = uint16_t((1 - float(appliedpct * 0.01)) * 65535); // falling edge, (reverse)
+        // Serial.print(" | ");
+        //Serial.print(dutyValueReverse);
+        // Serial.print(" | ");
+
+        if (appliedpct >= 2) // if pct > 2 ,  turn on bias enable.
+        {
+          // if(((bias_enable >> i) & 0x01) <= 0)
+          //{
+          // if the bit is not set,  we need to delay the write.
+          //Serial.println("delay pwm timestart now");
+          //delaypwmupdate_ms = millis();
+          //}
+          bias_enable |= (0x01 << i);   // bias enable on
+        }
+        else
+        {
+          bias_enable &= ~(0x01 << i);  // bias enable off,
+        }
+
+
+        int val = pwmValue;
+        if (((dimmerEdge >> i) & 0x01) > 0) // if forward
+        {
+          analogWrite(pwmPin_HVL[i], dutyValueForward);
+          pwmData[i] = dutyValueForward;
+
+
+          Serial.print("    ** ");
+          Serial.print(appliedpct);
+          Serial.print(" | ");
+          Serial.print(dutyValueForward);
+
+        }
+        else  // if reverse
+        {
+          if (dutyValueReverse == 0)
+            dutyValueReverse = 1;
+
+          analogWrite(pwmPin_HVL[i], dutyValueReverse);
+          pwmData[i] = dutyValueReverse;
+
+          Serial.print("    ** ");
+          Serial.print(appliedpct);
+          Serial.print(" | ");
+          Serial.print(dutyValueReverse);
+        }
+
+
+      } // end PHASE DIM
+      else  // else if  ***********  0-10 volt out dimm mode,  then just write the pwm val.
       {
-        if (dutyValueReverse == 0)
-          dutyValueReverse = 1;
-
-        analogWrite(pwmPin_HVL[i], dutyValueReverse);
-        pwmData[i] = dutyValueReverse;
+        Serial.print(" | ");
+        Serial.print(pct);
+        Serial.print(" | ");
+        analogWrite(pwmPin[i], pwmValue);
+        pwmData[i] = pwmValue; // store value for ref
       }
-      // note need to add hvdimm mode check here too, to make sure not 0 -10 volt.
 
-    }
+
+    }  // end HV
   }
   Serial.println("");
 
@@ -1391,8 +1512,12 @@ void setPWMBankto100pct(int bank)
   int startindex = 0;
   int endindex = 0;
   int i = 0;
-  int dutyValueReverse = int(float(100 * 0.01) * 65535); // rising edge. (forward)
-  int dutyValueForward = int((1 - float(100 * 0.01)) * 65535); // falling edge, (reverse)
+
+
+  // **** NOTE  11/6/17  we cap out at 80% in reality, , so just set to 80 here. 
+  
+  int dutyValueReverse = int(float(80 * 0.01) * 65535); // rising edge. (forward)
+  int dutyValueForward = int((1 - float(80 * 0.01)) * 65535); // falling edge, (reverse)
 
   if (bank == 0 || bank == 1)
   {
@@ -1537,15 +1662,15 @@ void MeasurePWMOutputCurrent()
       pwmcurrentstatus[(rms_channel_meas * 2) + 2] = counts & 0xFF; //(uint8_t)RMS;  // lsb, ;
 
       // for debug  ..**********************************
-      Serial.print("samplecount:   min max counts  avg  counts:  ");
+      //Serial.print("samplecount:   min max counts  avg  counts:  ");
 
-      Serial.print(num_samples_taken);
-      Serial.print("   :  ");
+      // Serial.print(num_samples_taken);
+      // Serial.print("   :  ");
       // Serial.print(samplemin);
       //Serial.print("  ");
       //Serial.print(samplemax);
       //Serial.print("  ");
-      Serial.println(counts);
+      // Serial.println(counts);
       // Serial.print("  ");
       // Serial.println(avg);
       // Serial.print("  ");
@@ -1597,18 +1722,17 @@ void MeasurePWMOutputCurrent()
 
 }
 
-
-
-// Power failover pseudo code ****
-
+//************************************ Power Failover Handler *****************
+/**************************************************************************************************************/
 void PowerFailOverTestAndHandle()
 {
   boolean changed = false;
   unsigned long current_timemillis = millis();
   unsigned long FAILURE_TIME_MS = 2500;  // time in MS,  till power is said to be 0,  then wait anothe 1 sec... and start failover.
-
+   
   boolean emergencypower_1_4  = ((current_timemillis - last_valid_power_src0) < FAILURE_TIME_MS);
   boolean linepower_1_4 = ((current_timemillis - last_valid_power_src1) < FAILURE_TIME_MS);
+  
   boolean emergencypower_5_8  = ((current_timemillis - last_valid_power_src2) < FAILURE_TIME_MS);
   boolean linepower_5_8 = ((current_timemillis - last_valid_power_src3) < FAILURE_TIME_MS);
 

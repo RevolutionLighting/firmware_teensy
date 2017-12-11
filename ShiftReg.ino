@@ -9,7 +9,7 @@ void setHV_AC_SENS_SRC(uint8_t src)
    last_hv_ac_sens_src_switch_mills = millis();
     updateHVSR();
 
-    // delay(50);  
+   
 }
 
 void updateHVSR()
@@ -27,22 +27,30 @@ void updateHVSR()
          // test. 
            
         // make MSB out of remainder parts.
-        int shift = hv_ac_sens_src + 2;
-        uint8_t MSB = (0x01 << shift) | src_nib;  //active high way 
+      //  int shift = hv_ac_sens_src + 2;
+      //  uint8_t MSB = (0x01 << shift) | src_nib;  //active high way 
 
        
         //active low on ac sens I think, 
-       //  uint8_t sensmask = 0x0F;
-       //  sensmask &= ~(0x01 << hv_ac_sens_src); // clear bit,
-      //  uint8_t MSB = (sensmask << 2) | src_nib;  //active low way, 
+         uint8_t sensmask = 0x0F;
+         sensmask &= ~(0x01 << hv_ac_sens_src); // clear bit,
+        uint8_t MSB = (sensmask << 2) | src_nib;  //active low way, 
+         // ************ END ACTIVE low way *******************
+
         
         int outputWord = MSB << 8 | hv_dimmerrelaystate;
        
-       // Serial.println("-----------------------------");
-      //  Serial.print("Update HVSR with 16 bit value: ");
-       // Serial.println(outputWord,HEX);
+      
        
-        shiftRegisterWriteWord16(outputWord);            // < --------------------- bring in when sr hw / relays are in place   ---------------- 
+       // shiftRegisterWriteWord16(outputWord);            // < --------------------- bring in when sr hw / relays are in place   ---------------- 
+
+          int temp = (int)bias_enable << 16;
+          int temp2 = temp | outputWord;
+     //   Serial.println("-----------------------------");
+      //  Serial.print("Update HVSR with 24 bit value: ");
+     //   Serial.println(temp2,HEX);
+     //   Serial.println("-----------------------------");
+        shiftRegisterWriteWord24( temp2); //  // <<<<<<<<<<<<<<<<<<<------ 9/29/16,  update -------------------------------->  
     }
 }
 
@@ -166,19 +174,20 @@ void shiftRegisterWriteWord16(int output)
 void shiftRegisterWriteWord24(int output)
 {
  // Serial.println("shiftRegisterWriteWord24 called");
+  int delayus = 2;
   byte i=0;
   for (i=0;i<24;i++)
   {
     if((output&0x800000)==0x800000) digitalWriteFast(SR_DAT,HIGH);
     else digitalWriteFast(SR_DAT,LOW);
-    delayMicroseconds(10);
+    delayMicroseconds(delayus);
     digitalWriteFast(SR_CLK,HIGH);
-    delayMicroseconds(10);
+    delayMicroseconds(delayus);
     digitalWriteFast(SR_CLK,LOW);
-    delayMicroseconds(10);
+    delayMicroseconds(delayus);
     output<<=1;
   }
   digitalWriteFast(SR_LAT,HIGH);
-  delayMicroseconds(10);
+  delayMicroseconds(delayus);
   digitalWriteFast(SR_LAT,LOW);
 }
