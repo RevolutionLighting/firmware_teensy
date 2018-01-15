@@ -2,6 +2,10 @@
 // Revolution Lighting Project Firmware
 //-------------------------------------------------------------------------------------
 
+
+// version 1.3 
+// lv - speed up of current measurments  1/12/18
+
 //version 1.2
 // rev d hvh bringup
 
@@ -74,8 +78,8 @@
 // (7) started commenting/refactoring code for readability
 //-------------------------------------------------------------------------------------
 uint8_t RELEASENUMBERMAJOR = 1;
-uint8_t RELEASENUMBERMINOR = 2;
-#define LV_HV 1 //LV=0, HV=1
+uint8_t RELEASENUMBERMINOR = 3;
+#define LV_HV 0 //LV=0, HV=1
 #include <arduino.h>
 #include <i2c_t3.h>
 boolean MEASURE_LOOPTIME = false;
@@ -1606,7 +1610,7 @@ void MeasurePWMOutputCurrent()
         pwmcurrentsamplecount++; // this is how many samples total we have taken. per channel.
       }
 
-      if (pwmcurrentsamplecount > 500)  // once we have 2 k samples.
+      if (pwmcurrentsamplecount > 150) // changed from 500)  v1.3 LV  // once we have X samples.
       {
         //  Serial.println("PWM measurment done");
         memset(pwmcurrentstatus, 0, sizeof(pwmcurrentstatus));
