@@ -79,7 +79,7 @@
 //-------------------------------------------------------------------------------------
 uint8_t RELEASENUMBERMAJOR = 1;
 uint8_t RELEASENUMBERMINOR = 3;
-#define LV_HV 0 //LV=0, HV=1
+#define LV_HV 1 //LV=0, HV=1
 #include <arduino.h>
 #include <i2c_t3.h>
 boolean MEASURE_LOOPTIME = false;
